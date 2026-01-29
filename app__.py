@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
-"""TTS翻譯（Windows / Win11）
+"""
+TTS翻譯（Windows / Win11）
 
-功能：
-- 常駐工作列（系統匣）小工具
-- 監聽 Ctrl+C（全域）後，於滑鼠旁顯示「翻譯」與「播放」按鈕
-- 自動判斷中/英文（譯向與語音各自獨立）
-- 左鍵點擊系統匣圖示：開啟設定（選擇中/英文語音、啟用/停用、結束程式）
-- 預設為不啟用
+本版依需求調整：
+- 彈窗不再自動關閉（移除預設關閉時間）
+- 彈窗只顯示「翻譯後的中文」與「播放/停止」按鈕（不顯示英文原文）
+- 播放按鈕：按下切換為停止；按停止會立即停止播放（播放內容＝中文翻譯）
+- 任何滑鼠點擊只要不是點在彈窗上就關閉彈窗；滾輪事件也會關閉彈窗
+  - 這需要全域滑鼠監聽（pynput.mouse）。
 
-主要依賴：
-- PySide6（UI / tray）
-- pynput（全域快捷鍵 Ctrl+C）
-- pywin32（SAPI：列舉與使用 Windows 系統語音）
+觸發來源：剪貼簿文字變更（涵蓋 Ctrl+C/右鍵/選單複製）
+翻譯：translate.googleapis.com client=gtx（非官方端點）
+TTS：Windows SAPI（pywin32）
 
-翻譯服務：
-- translate.googleapis.com 的 gtx 端點（非官方，可能受網路/地區影響）
+依賴：PySide6 / pynput / pywin32
 """
 
 from __future__ import annotations
@@ -33,47 +32,45 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+# pynput：全域滑鼠監聽（關閉彈窗）
 try:
-    from pynput import keyboard  # type: ignore
-except Exception:  # pragma: no cover
-    keyboard = None  # type: ignore
+    from pynput import mouse  # type: ignore
+except Exception:
+    mouse = None  # type: ignore
 
+# pywin32：Windows SAPI TTS
 try:
     import win32com.client  # type: ignore
-except Exception:  # pragma: no cover
+    import pythoncom  # type: ignore
+except Exception:
     win32com = None  # type: ignore
+    pythoncom = None  # type: ignore
 
 
 APP_TITLE = "TTS翻譯"
 DEFAULT_ENABLED = False
-DEFAULT_POPUP_AUTO_HIDE_MS = 12000
 DEFAULT_MAX_CHARS = 500
 DEFAULT_TRANSLATE_TIMEOUT_SEC = 6.0
 
+# Theme（集中管理）
 ACCENT = "#72e3fd"
-BG = "#0f1117"
-SURFACE = "#151925"
-BORDER = "rgba(114,227,253,0.35)"
-TEXT = "rgba(255,255,255,0.92)"
-MUTED = "rgba(255,255,255,0.68)"
+BG = "#0f141a"
+SURFACE = "#141b2d"
+TEXT = "#e8eef4"
+MUTED = "rgba(232,238,244,0.78)"
+BORDER = "rgba(114,227,253,0.32)"
 
-# user_data（與 app_main.py 同層）
 APP_DIR = Path(__file__).resolve().parent
 USER_DATA = APP_DIR / "user_data"
 LOG_DIR = USER_DATA / "logs"
 SETTINGS_PATH = USER_DATA / "settings.json"
 
 
-# -----------------------------
-# 設定 / IO
-# -----------------------------
 @dataclass
 class Settings:
     enabled: bool = DEFAULT_ENABLED
-    # SAPI voice token id（字串）；留空 => 自動挑第一個符合語系的聲音
-    voice_en_id: str = ""
-    voice_zh_id: str = ""
-    popup_auto_hide_ms: int = DEFAULT_POPUP_AUTO_HIDE_MS
+    voice_zh_id: str = ""  # SAPI token id；空字串 => 自動
+    voice_en_id: str = ""  # 保留但本版不播放英文
     max_chars: int = DEFAULT_MAX_CHARS
     translate_timeout_sec: float = DEFAULT_TRANSLATE_TIMEOUT_SEC
 
@@ -103,33 +100,27 @@ class SettingsStore:
             self.path.write_text(json.dumps(asdict(s), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _ensure_dirs() -> None:
+    USER_DATA.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / "app.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler()],
     )
     logging.info("=== %s 啟動 ===", APP_TITLE)
 
 
-# -----------------------------
-# 中英判斷 / 翻譯
-# -----------------------------
 _RE_ZH = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 _RE_EN = re.compile(r"[A-Za-z]")
 
 
 def detect_lang(text: str) -> str:
-    """回傳 "zh" 或 "en"。
-
-    - 若中文字元比例較高 => zh
-    - 否則 => en
-    """
     t = (text or "").strip()
     if not t:
         return "en"
@@ -141,8 +132,6 @@ def detect_lang(text: str) -> str:
 
 
 class GoogleTranslator:
-    """translate.googleapis.com 非官方端點（與你的 JS 版一致 client=gtx）。"""
-
     def __init__(self):
         self._cache: Dict[Tuple[str, str, str], str] = {}
         self._lock = threading.Lock()
@@ -166,11 +155,7 @@ class GoogleTranslator:
             data = json.loads(raw)
             translated = ""
             if isinstance(data, list) and data and isinstance(data[0], list):
-                translated = "".join(
-                    (seg[0] or "")
-                    for seg in data[0]
-                    if isinstance(seg, list) and seg
-                )
+                translated = "".join((seg[0] or "") for seg in data[0] if isinstance(seg, list) and seg)
             translated = translated.strip()
         except Exception as e:
             logging.warning("translate failed: %s", e)
@@ -192,10 +177,6 @@ class VoiceInfo:
 
 
 def _parse_sapi_language_attr(lang_attr: str) -> List[int]:
-    """SAPI token Language attribute 常見格式："409" / "404" / "409;809"。
-
-    以 16 進位解析成 LCID int。
-    """
     out: List[int] = []
     for part in (lang_attr or "").split(";"):
         s = part.strip()
@@ -209,7 +190,6 @@ def _parse_sapi_language_attr(lang_attr: str) -> List[int]:
 
 
 def _classify_lcids(lcids: List[int]) -> str:
-    # Windows Language ID 低位 byte：0x09 英文，0x04 中文（含繁簡）
     for lcid in lcids:
         if (lcid & 0xFF) == 0x04:
             return "zh"
@@ -230,16 +210,13 @@ class SapiVoiceManager:
             infos: List[VoiceInfo] = []
             for i in range(tokens.Count):
                 tok = tokens.Item(i)
+                token_id = getattr(tok, "Id", "") or ""
                 try:
-                    token_id = tok.Id  # type: ignore[attr-defined]
-                except Exception:
-                    token_id = ""
-                try:
-                    desc = tok.GetDescription()  # type: ignore[attr-defined]
+                    desc = tok.GetDescription()
                 except Exception:
                     desc = f"Voice {i}"
                 try:
-                    lang_attr = tok.GetAttribute("Language")  # type: ignore[attr-defined]
+                    lang_attr = tok.GetAttribute("Language")
                 except Exception:
                     lang_attr = ""
                 group = _classify_lcids(_parse_sapi_language_attr(lang_attr))
@@ -250,30 +227,46 @@ class SapiVoiceManager:
             return []
 
 
-class SapiTTSWorker(threading.Thread):
-    """以背景 thread 執行 SAPI Speak，避免阻塞 UI。"""
+class TTSNotifier(QtCore.QObject):
+    finished = QtCore.Signal(int)  # token
+    stopped = QtCore.Signal(int)   # token
 
-    def __init__(self):
+
+class SapiTTSWorker(threading.Thread):
+    """
+    背景 thread：以 SAPI 非同步 Speak，並可 stop
+    """
+    def __init__(self, notifier: TTSNotifier):
         super().__init__(daemon=True)
         self._q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self._stop_evt = threading.Event()
+
+        self._notifier = notifier
+
         self._voice = None
         self._token_map: Dict[str, Any] = {}
 
+        self._speaking = False
+        self._current_token = 0
+        self._speaking_since = 0.0
+
     def run(self) -> None:
+        try:
+            if pythoncom is not None:
+                pythoncom.CoInitialize()
+        except Exception:
+            pass
+
         if win32com is None:
-            logging.error("pywin32 不可用，無法使用 Windows 語音。")
             return
+
         try:
             self._voice = win32com.client.Dispatch("SAPI.SpVoice")
             tokens = self._voice.GetVoices()
             self._token_map = {}
             for i in range(tokens.Count):
                 tok = tokens.Item(i)
-                try:
-                    tid = tok.Id
-                except Exception:
-                    tid = ""
+                tid = getattr(tok, "Id", "") or ""
                 if tid:
                     self._token_map[tid] = tok
         except Exception as e:
@@ -282,23 +275,64 @@ class SapiTTSWorker(threading.Thread):
 
         while not self._stop_evt.is_set():
             try:
-                cmd, payload = self._q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            try:
-                if cmd == "STOP":
-                    self._purge()
-                elif cmd == "SPEAK":
-                    text, voice_token_id = payload
-                    self._speak(text, voice_token_id)
-                elif cmd == "QUIT":
+                cmd, payload = self._q.get(timeout=0.05)
+                if cmd == "QUIT":
                     self._purge()
                     break
-            except Exception as e:
-                logging.warning("TTS worker error: %s", e)
 
-        self._stop_evt.set()
+                if cmd == "STOP":
+                    tok = self._current_token
+                    self._purge()
+                    self._speaking = False
+                    try:
+                        self._notifier.stopped.emit(tok)
+                    except Exception:
+                        pass
+                    continue
+
+                if cmd == "SPEAK":
+                    text, voice_token_id, tok = payload
+                    self._current_token = int(tok)
+                    self._speaking_since = time.monotonic()
+                    self._speak_async(str(text), str(voice_token_id))
+                    self._speaking = True
+                    continue
+
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logging.warning("TTS worker queue error: %s", e)
+
+            if self._speaking and self._voice is not None:
+                try:
+                    st = getattr(self._voice, "Status", None)
+                    running = int(getattr(st, "RunningState", 0)) if st is not None else 0
+                    # 避免剛開始時 RunningState 還沒更新（短時間 0）造成誤判
+                    if running == 0 and (time.monotonic() - self._speaking_since) > 0.15:
+                        tok = self._current_token
+                        self._speaking = False
+                        try:
+                            self._notifier.finished.emit(tok)
+                        except Exception:
+                            pass
+                except Exception:
+                    tok = self._current_token
+                    self._speaking = False
+                    try:
+                        self._notifier.finished.emit(tok)
+                    except Exception:
+                        pass
+
+        try:
+            self._purge()
+        except Exception:
+            pass
+
+        try:
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
+        except Exception:
+            pass
 
     def _purge(self) -> None:
         # SVSFPurgeBeforeSpeak = 2
@@ -308,7 +342,7 @@ class SapiTTSWorker(threading.Thread):
         except Exception:
             pass
 
-    def _speak(self, text: str, voice_token_id: str) -> None:
+    def _speak_async(self, text: str, voice_token_id: str) -> None:
         if not text.strip() or self._voice is None:
             return
         self._purge()
@@ -319,13 +353,15 @@ class SapiTTSWorker(threading.Thread):
                 self._voice.Voice = tok
             except Exception:
                 pass
+
+        # SVSFlagsAsync = 1
         try:
-            self._voice.Speak(text, 0)  # 同步（在背景 thread 內）
+            self._voice.Speak(text, 1)
         except Exception as e:
             logging.warning("Speak failed: %s", e)
 
-    def speak(self, text: str, voice_token_id: str) -> None:
-        self._q.put(("SPEAK", (text, voice_token_id)))
+    def speak(self, text: str, voice_token_id: str, token: int) -> None:
+        self._q.put(("SPEAK", (text, voice_token_id, int(token))))
 
     def stop(self) -> None:
         self._q.put(("STOP", None))
@@ -336,11 +372,55 @@ class SapiTTSWorker(threading.Thread):
 
 
 # -----------------------------
-# UI：Popup（滑鼠旁）
+# 全域滑鼠監聽（關閉彈窗/滾輪關閉）
+# -----------------------------
+class GlobalMouseWatcher(QtCore.QObject):
+    clicked = QtCore.Signal(int, int)  # x, y
+    wheel = QtCore.Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._listener = None
+
+    def start(self) -> None:
+        if mouse is None:
+            logging.info("pynput.mouse 不可用：無法全域關閉彈窗（點擊/滾輪）")
+            return
+
+        def on_click(x, y, button, pressed):
+            if pressed:
+                try:
+                    self.clicked.emit(int(x), int(y))
+                except Exception:
+                    pass
+
+        def on_scroll(x, y, dx, dy):
+            try:
+                self.wheel.emit()
+            except Exception:
+                pass
+
+        try:
+            self._listener = mouse.Listener(on_click=on_click, on_scroll=on_scroll)
+            self._listener.daemon = True
+            self._listener.start()
+            logging.info("GlobalMouseWatcher started")
+        except Exception as e:
+            logging.warning("GlobalMouseWatcher failed: %s", e)
+
+    def stop(self) -> None:
+        try:
+            if self._listener:
+                self._listener.stop()
+        except Exception:
+            pass
+
+
+# -----------------------------
+# UI：Popup（只顯示中文翻譯 + 播放/停止）
 # -----------------------------
 class PopupWidget(QtWidgets.QWidget):
-    play_clicked = QtCore.Signal()
-    translate_clicked = QtCore.Signal()
+    play_toggle = QtCore.Signal()
     closed = QtCore.Signal()
 
     def __init__(self):
@@ -355,12 +435,9 @@ class PopupWidget(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self.setFocusPolicy(QtCore.Qt.NoFocus)
 
-        self._text = ""
-        self._translated = ""
-
-        self._auto_hide_timer = QtCore.QTimer(self)
-        self._auto_hide_timer.setSingleShot(True)
-        self._auto_hide_timer.timeout.connect(self.hide_and_emit)
+        self._text_src = ""
+        self._text_zh = ""
+        self._playing = False
 
         self._build_ui()
 
@@ -368,102 +445,105 @@ class PopupWidget(QtWidgets.QWidget):
         root = QtWidgets.QFrame()
         root.setObjectName("popupRoot")
 
-        self.btn_translate = QtWidgets.QToolButton()
-        self.btn_translate.setObjectName("btnTranslate")
-        self.btn_translate.setToolTip("重新翻譯")
-        self.btn_translate.setText("譯")
-        self.btn_translate.clicked.connect(self.translate_clicked.emit)
-
         self.btn_play = QtWidgets.QToolButton()
         self.btn_play.setObjectName("btnPlay")
-        self.btn_play.setToolTip("播放原文")
-        self.btn_play.setText("播")
-        self.btn_play.clicked.connect(self.play_clicked.emit)
+        self.btn_play.setCursor(QtCore.Qt.PointingHandCursor)
+        self.btn_play.setIconSize(QtCore.QSize(26, 26))
+        self.btn_play.setFixedSize(64, 64)
+        self.btn_play.clicked.connect(self.play_toggle.emit)
 
-        self.btn_close = QtWidgets.QToolButton()
-        self.btn_close.setObjectName("btnClose")
-        self.btn_close.setToolTip("關閉")
-        self.btn_close.setText("×")
-        self.btn_close.clicked.connect(self.hide_and_emit)
+        self.lbl_zh = QtWidgets.QLabel()
+        self.lbl_zh.setObjectName("lblZh")
+        self.lbl_zh.setWordWrap(True)
+        self.lbl_zh.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
-        self.lbl_src = QtWidgets.QLabel()
-        self.lbl_src.setObjectName("lblSrc")
-        self.lbl_src.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-
-        self.lbl_tr = QtWidgets.QLabel()
-        self.lbl_tr.setObjectName("lblTr")
-        self.lbl_tr.setWordWrap(True)
-        self.lbl_tr.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-
-        btns = QtWidgets.QHBoxLayout()
-        btns.setContentsMargins(0, 0, 0, 0)
-        btns.setSpacing(8)
-        btns.addWidget(self.btn_translate)
-        btns.addWidget(self.btn_play)
-        btns.addStretch(1)
-        btns.addWidget(self.btn_close)
-
-        lay = QtWidgets.QVBoxLayout(root)
-        lay.setContentsMargins(12, 12, 12, 10)
-        lay.setSpacing(8)
-        lay.addLayout(btns)
-        lay.addWidget(self.lbl_src)
-        lay.addWidget(self.lbl_tr)
+        lay = QtWidgets.QHBoxLayout(root)
+        lay.setContentsMargins(16, 16, 18, 16)
+        lay.setSpacing(14)
+        lay.addWidget(self.btn_play, 0, QtCore.Qt.AlignVCenter)
+        lay.addWidget(self.lbl_zh, 1)
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.addWidget(root)
 
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(26)
+        shadow.setOffset(0, 10)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 130))
+        root.setGraphicsEffect(shadow)
+
         self.setStyleSheet(self._style_sheet())
+        self.set_playing(False)
+        self.set_enabled_play(False)
 
     def _style_sheet(self) -> str:
         return f"""
         #popupRoot {{
-            background: {SURFACE};
+            background: rgba(20, 27, 45, 0.96);
             border: 1px solid {BORDER};
-            border-radius: 14px;
+            border-radius: 20px;
         }}
-        QLabel {{
+        #lblZh {{
             color: {TEXT};
-            font-size: 13px;
+            font-size: 24px;
+            font-weight: 600;
+            line-height: 1.25;
         }}
-        #lblSrc {{
-            color: {MUTED};
-            font-size: 12px;
-        }}
-        QToolButton {{
+        #btnPlay {{
             background: rgba(255,255,255,0.06);
-            border: 1px solid rgba(255,255,255,0.10);
-            border-radius: 10px;
-            padding: 6px 10px;
-            color: {TEXT};
-            font-size: 12px;
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 32px;
         }}
-        QToolButton:hover {{
+        #btnPlay:hover {{
             border-color: {ACCENT};
             background: rgba(114,227,253,0.12);
         }}
-        #btnClose {{
-            border-radius: 999px;
-            padding: 4px 8px;
+        #btnPlay:pressed {{
+            background: rgba(114,227,253,0.18);
         }}
         """
 
-    def show_near_cursor(self, text: str, translated: str, auto_hide_ms: int) -> None:
-        self._text = text
-        self._translated = translated
+    def _icon_play(self) -> QtGui.QIcon:
+        pm = QtGui.QPixmap(48, 48)
+        pm.fill(QtCore.Qt.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(114, 227, 253, 255))
+        points = [QtCore.QPointF(18, 14), QtCore.QPointF(18, 34), QtCore.QPointF(34, 24)]
+        p.drawPolygon(QtGui.QPolygonF(points))
+        p.end()
+        return QtGui.QIcon(pm)
 
-        src_preview = text.strip().replace("\n", " ")
-        if len(src_preview) > 80:
-            src_preview = src_preview[:80] + "…"
+    def _icon_stop(self) -> QtGui.QIcon:
+        pm = QtGui.QPixmap(48, 48)
+        pm.fill(QtCore.Qt.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(QtGui.QColor(114, 227, 253, 255))
+        p.drawRoundedRect(QtCore.QRectF(16, 16, 16, 16), 4, 4)
+        p.end()
+        return QtGui.QIcon(pm)
 
-        self.lbl_src.setText(src_preview)
-        self.lbl_tr.setText(translated if translated else "翻譯中…")
+    def set_enabled_play(self, ok: bool) -> None:
+        self.btn_play.setEnabled(bool(ok))
+        self.btn_play.setToolTip("播放/停止" if ok else "翻譯中…")
 
+    def set_playing(self, playing: bool) -> None:
+        self._playing = bool(playing)
+        self.btn_play.setIcon(self._icon_stop() if self._playing else self._icon_play())
+
+    def show_near_cursor(self, src_text: str, zh_text: str) -> None:
+        self._text_src = src_text
+        self._text_zh = zh_text
+
+        self.lbl_zh.setText(zh_text if zh_text else "翻譯中…")
         self.adjustSize()
-        pos = QtGui.QCursor.pos()
 
-        x = pos.x() + 16
+        pos = QtGui.QCursor.pos()
+        x = pos.x() + 18
         y = pos.y() + 18
 
         screen = QtGui.QGuiApplication.screenAt(pos) or QtGui.QGuiApplication.primaryScreen()
@@ -476,30 +556,40 @@ class PopupWidget(QtWidgets.QWidget):
 
         self.move(x, y)
         self.show()
-        self._auto_hide_timer.start(max(500, int(auto_hide_ms)))
 
-    def update_translation(self, translated: str) -> None:
-        self._translated = translated
-        self.lbl_tr.setText(translated if translated else "（翻譯失敗或被阻擋）")
+    def update_zh_text(self, zh_text: str) -> None:
+        self._text_zh = zh_text
+        self.lbl_zh.setText(zh_text if zh_text else "（翻譯失敗或被阻擋）")
         self.adjustSize()
 
     def hide_and_emit(self) -> None:
         self.hide()
         self.closed.emit()
 
+    def contains_global_point(self, x: int, y: int) -> bool:
+        if not self.isVisible():
+            return False
+        top_left = self.mapToGlobal(QtCore.QPoint(0, 0))
+        rect = QtCore.QRect(top_left, self.size())
+        return rect.contains(QtCore.QPoint(int(x), int(y)))
+
     @property
-    def text(self) -> str:
-        return self._text
+    def src_text(self) -> str:
+        return self._text_src
+
+    @property
+    def zh_text(self) -> str:
+        return self._text_zh
 
 
 # -----------------------------
-# UI：設定視窗
+# UI：設定視窗（語音選擇 + 啟用）
 # -----------------------------
 class SettingsDialog(QtWidgets.QDialog):
     settings_changed = QtCore.Signal(Settings)
     request_quit = QtCore.Signal()
 
-    def __init__(self, parent: QtWidgets.QWidget, store: SettingsStore, sapi_voices: List[VoiceInfo]):
+    def __init__(self, parent: QtWidgets.QWidget, store: SettingsStore, sapi_voices: List[VoiceInfo], tts_available: bool):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_TITLE}｜設定")
         self.setWindowModality(QtCore.Qt.NonModal)
@@ -507,6 +597,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self._store = store
         self._voices = sapi_voices
+        self._tts_available = tts_available
         self._s = store.load()
 
         self._build_ui()
@@ -529,20 +620,29 @@ class SettingsDialog(QtWidgets.QDialog):
                 padding: 0 6px;
                 color: {MUTED};
             }}
+            QCheckBox {{ spacing: 8px; }}
             QComboBox, QSpinBox, QDoubleSpinBox {{
                 background: {SURFACE};
-                border: 1px solid rgba(255,255,255,0.10);
+                border: 1px solid rgba(255,255,255,0.12);
                 border-radius: 10px;
                 padding: 6px 10px;
             }}
-            QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {{ border-color: {ACCENT}; }}
+            QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {{
+                border-color: {ACCENT};
+            }}
             QPushButton {{
                 background: rgba(114,227,253,0.12);
                 border: 1px solid rgba(114,227,253,0.35);
                 border-radius: 10px;
                 padding: 8px 12px;
             }}
-            QPushButton:hover {{ background: rgba(114,227,253,0.18); border-color: {ACCENT}; }}
+            QPushButton:hover {{
+                background: rgba(114,227,253,0.18);
+                border-color: {ACCENT};
+            }}
+            QPushButton:pressed {{
+                background: rgba(114,227,253,0.22);
+            }}
             """
         )
 
@@ -551,45 +651,38 @@ class SettingsDialog(QtWidgets.QDialog):
         lay.setContentsMargins(14, 14, 14, 14)
         lay.setSpacing(12)
 
-        self.chk_enabled = QtWidgets.QCheckBox("啟用（監聽 Ctrl+C 並顯示翻譯/播放）")
+        self.chk_enabled = QtWidgets.QCheckBox("啟用（剪貼簿文字變更時顯示彈窗）")
         lay.addWidget(self.chk_enabled)
 
-        grp_voice = QtWidgets.QGroupBox("語音")
+        grp_voice = QtWidgets.QGroupBox("中文語音（播放翻譯）")
         vlay = QtWidgets.QFormLayout(grp_voice)
         vlay.setContentsMargins(12, 12, 12, 12)
         vlay.setSpacing(10)
 
-        self.cmb_en = QtWidgets.QComboBox()
         self.cmb_zh = QtWidgets.QComboBox()
+        self.lbl_tts_state = QtWidgets.QLabel("")
+        self.lbl_tts_state.setStyleSheet(f"color: {MUTED};")
 
-        vlay.addRow("英文語音（en-*）：", self.cmb_en)
         vlay.addRow("中文語音（zh-*）：", self.cmb_zh)
-
+        vlay.addRow("TTS 狀態：", self.lbl_tts_state)
         lay.addWidget(grp_voice)
 
-        grp_misc = QtWidgets.QGroupBox("顯示 / 翻譯")
+        grp_misc = QtWidgets.QGroupBox("翻譯")
         mlay = QtWidgets.QFormLayout(grp_misc)
         mlay.setContentsMargins(12, 12, 12, 12)
         mlay.setSpacing(10)
-
-        self.spn_hide = QtWidgets.QSpinBox()
-        self.spn_hide.setRange(1000, 60000)
-        self.spn_hide.setSingleStep(1000)
-        self.spn_hide.setSuffix(" ms")
-
-        self.spn_max = QtWidgets.QSpinBox()
-        self.spn_max.setRange(50, 5000)
-        self.spn_max.setSingleStep(50)
 
         self.dsp_timeout = QtWidgets.QDoubleSpinBox()
         self.dsp_timeout.setRange(1.0, 30.0)
         self.dsp_timeout.setSingleStep(0.5)
         self.dsp_timeout.setSuffix(" 秒")
 
-        mlay.addRow("彈窗自動關閉：", self.spn_hide)
-        mlay.addRow("最長字數：", self.spn_max)
-        mlay.addRow("翻譯逾時：", self.dsp_timeout)
+        self.spn_max = QtWidgets.QSpinBox()
+        self.spn_max.setRange(50, 5000)
+        self.spn_max.setSingleStep(50)
 
+        mlay.addRow("翻譯逾時：", self.dsp_timeout)
+        mlay.addRow("最長字數：", self.spn_max)
         lay.addWidget(grp_misc)
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -598,11 +691,11 @@ class SettingsDialog(QtWidgets.QDialog):
         self.btn_save = QtWidgets.QPushButton("儲存")
         self.btn_save.clicked.connect(self._on_save)
 
-        self.btn_quit = QtWidgets.QPushButton("結束程式")
-        self.btn_quit.clicked.connect(self.request_quit.emit)
-
         self.btn_close = QtWidgets.QPushButton("關閉")
         self.btn_close.clicked.connect(self.close)
+
+        self.btn_quit = QtWidgets.QPushButton("結束程式")
+        self.btn_quit.clicked.connect(self.request_quit.emit)
 
         btn_row.addWidget(self.btn_save)
         btn_row.addWidget(self.btn_close)
@@ -611,45 +704,31 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self._populate_voices()
 
+        self.lbl_tts_state.setText("可用" if self._tts_available else "不可用（未安裝 pywin32 或 SAPI 初始化失敗）")
+
     def _populate_voices(self) -> None:
-        self.cmb_en.clear()
         self.cmb_zh.clear()
-
-        en = [v for v in self._voices if v.group == "en"]
-        zh = [v for v in self._voices if v.group == "zh"]
-        if not en:
-            en = self._voices[:]
-        if not zh:
-            zh = self._voices[:]
-
-        def add_items(cmb: QtWidgets.QComboBox, items: List[VoiceInfo]) -> None:
-            cmb.addItem("（自動選擇）", userData="")
-            for v in items:
-                cmb.addItem(v.description, userData=v.token_id)
-
-        add_items(self.cmb_en, en)
-        add_items(self.cmb_zh, zh)
+        if not self._voices:
+            self.cmb_zh.addItem("（未偵測到語音；請安裝 pywin32 / Windows 語音）", userData="")
+            return
+        zh = [v for v in self._voices if v.group == "zh"] or self._voices[:]
+        self.cmb_zh.addItem("（自動選擇）", userData="")
+        for v in zh:
+            self.cmb_zh.addItem(v.description, userData=v.token_id)
 
     def _load_to_ui(self) -> None:
         s = self._s
         self.chk_enabled.setChecked(bool(s.enabled))
-        self.spn_hide.setValue(int(s.popup_auto_hide_ms))
-        self.spn_max.setValue(int(s.max_chars))
         self.dsp_timeout.setValue(float(s.translate_timeout_sec))
-
-        def set_combo(cmb: QtWidgets.QComboBox, token_id: str) -> None:
-            idx = cmb.findData(token_id)
-            cmb.setCurrentIndex(idx if idx >= 0 else 0)
-
-        set_combo(self.cmb_en, s.voice_en_id)
-        set_combo(self.cmb_zh, s.voice_zh_id)
+        self.spn_max.setValue(int(s.max_chars))
+        idx = self.cmb_zh.findData(s.voice_zh_id)
+        self.cmb_zh.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _on_save(self) -> None:
         s = Settings(
             enabled=self.chk_enabled.isChecked(),
-            voice_en_id=str(self.cmb_en.currentData() or ""),
             voice_zh_id=str(self.cmb_zh.currentData() or ""),
-            popup_auto_hide_ms=int(self.spn_hide.value()),
+            voice_en_id=self._s.voice_en_id,
             max_chars=int(self.spn_max.value()),
             translate_timeout_sec=float(self.dsp_timeout.value()),
         )
@@ -659,56 +738,11 @@ class SettingsDialog(QtWidgets.QDialog):
 
 
 # -----------------------------
-# 主程式：tray / hotkey / clipboard / popup
+# 主程式控制器
 # -----------------------------
-class HotkeyWatcher(QtCore.QObject):
-    """使用 pynput 監聽 Ctrl+C（全域）。"""
-
-    ctrl_c = QtCore.Signal()
-
-    def __init__(self):
-        super().__init__()
-        self._listener = None
-        self._ctrl_down = False
-
-    def start(self) -> None:
-        if keyboard is None:
-            logging.error("pynput 不可用，無法全域監聽 Ctrl+C。")
-            return
-
-        def on_press(key):
-            try:
-                if key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-                    self._ctrl_down = True
-                elif self._ctrl_down:
-                    if hasattr(key, "char") and key.char and key.char.lower() == "c":
-                        self.ctrl_c.emit()
-            except Exception:
-                pass
-
-        def on_release(key):
-            try:
-                if key in (keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
-                    self._ctrl_down = False
-            except Exception:
-                pass
-
-        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self._listener.daemon = True
-        self._listener.start()
-        logging.info("HotkeyWatcher started")
-
-    def stop(self) -> None:
-        try:
-            if self._listener:
-                self._listener.stop()
-        except Exception:
-            pass
-
-
 class AppController(QtCore.QObject):
-    # [PATCH] fix-translate-stuck: use-signal
-    translation_ready = QtCore.Signal(str, str)
+    translation_ready = QtCore.Signal(str, str)  # (src_text, zh_text)
+
     def __init__(self, app: QtWidgets.QApplication):
         super().__init__()
         self.app = app
@@ -716,33 +750,54 @@ class AppController(QtCore.QObject):
         self.settings = self.store.load()
 
         self.translator = GoogleTranslator()
+
         self.popup = PopupWidget()
-        self.popup.play_clicked.connect(self.on_play_clicked)
-        self.popup.translate_clicked.connect(self.on_translate_clicked)
+        self.popup.play_toggle.connect(self.on_play_toggle)
+        self.popup.closed.connect(self.on_popup_closed)
 
-        self.translation_ready.connect(self.on_translation_ready)
-        self._last_ctrl_c_ts = 0.0
-        self._last_shown_text = ""
-        self._last_shown_ts = 0.0
-
-        self.hotkeys = HotkeyWatcher()
-        self.hotkeys.ctrl_c.connect(self.on_ctrl_c)
-        self.hotkeys.start()
+        self.mouse_watcher = GlobalMouseWatcher()
+        self.mouse_watcher.clicked.connect(self.on_global_click)
+        self.mouse_watcher.wheel.connect(self.on_global_wheel)
+        self.mouse_watcher.start()
 
         self.clipboard = self.app.clipboard()
         self.clipboard.dataChanged.connect(self.on_clipboard_changed)
 
-        self._tts_worker = SapiTTSWorker()
-        self._tts_worker.start()
+        self.tts_notifier = TTSNotifier()
+        self.tts_notifier.finished.connect(self.on_tts_finished)
+        self.tts_notifier.stopped.connect(self.on_tts_stopped)
+
+        self._tts_worker: Optional[SapiTTSWorker] = None
+        self._tts_available = False
+        if win32com is not None:
+            try:
+                self._tts_worker = SapiTTSWorker(self.tts_notifier)
+                self._tts_worker.start()
+                self._tts_available = True
+            except Exception as e:
+                logging.warning("TTS worker start failed: %s", e)
+                self._tts_worker = None
+                self._tts_available = False
+
+        self._play_token = 0
+        self.translation_ready.connect(self.on_translation_ready)
 
         self._settings_dialog: Optional[SettingsDialog] = None
         self._tray = self._create_tray()
+
+        if not self.settings.enabled:
+            self._tray.showMessage(APP_TITLE, "已啟動（預設未啟用）。右鍵系統匣圖示 → 勾選「啟用」。", QtWidgets.QSystemTrayIcon.Information, 4000)
+        if mouse is None:
+            self._tray.showMessage(APP_TITLE, "提示：未安裝 pynput，無法做到「點擊/滾輪在任何地方關閉彈窗」。", QtWidgets.QSystemTrayIcon.Warning, 4500)
+        if not self._tts_available:
+            self._tray.showMessage(APP_TITLE, "提示：未安裝 pywin32 或 SAPI 不可用，播放功能將無法使用。", QtWidgets.QSystemTrayIcon.Warning, 4500)
 
     def _create_tray(self) -> QtWidgets.QSystemTrayIcon:
         tray = QtWidgets.QSystemTrayIcon(self._make_tray_icon(), self.app)
         tray.setToolTip(APP_TITLE)
 
         menu = QtWidgets.QMenu()
+
         self.act_enabled = QtGui.QAction("啟用", menu)
         self.act_enabled.setCheckable(True)
         self.act_enabled.setChecked(bool(self.settings.enabled))
@@ -751,12 +806,16 @@ class AppController(QtCore.QObject):
         act_settings = QtGui.QAction("設定…", menu)
         act_settings.triggered.connect(self.open_settings)
 
+        act_test = QtGui.QAction("測試彈窗", menu)
+        act_test.triggered.connect(self.test_popup)
+
         act_quit = QtGui.QAction("結束", menu)
         act_quit.triggered.connect(self.quit)
 
         menu.addAction(self.act_enabled)
         menu.addSeparator()
         menu.addAction(act_settings)
+        menu.addAction(act_test)
         menu.addSeparator()
         menu.addAction(act_quit)
 
@@ -771,21 +830,17 @@ class AppController(QtCore.QObject):
         pm.fill(QtCore.Qt.transparent)
         p = QtGui.QPainter(pm)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-
         p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(QtGui.QColor(21, 25, 37, 255))
+        p.setBrush(QtGui.QColor(20, 27, 45, 255))
         p.drawEllipse(4, 4, size - 8, size - 8)
-
         pen = QtGui.QPen(QtGui.QColor(114, 227, 253, 255))
         pen.setWidth(4)
         p.setPen(pen)
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawEllipse(12, 12, size - 24, size - 24)
-
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(QtGui.QColor(114, 227, 253, 255))
         p.drawEllipse(size // 2 - 6, size // 2 - 6, 12, 12)
-
         p.end()
         return QtGui.QIcon(pm)
 
@@ -796,12 +851,11 @@ class AppController(QtCore.QObject):
     def open_settings(self) -> None:
         voices = SapiVoiceManager.list_voices()
         if not self._settings_dialog:
-            dlg = SettingsDialog(None, self.store, voices)
+            dlg = SettingsDialog(None, self.store, voices, tts_available=self._tts_available)
             dlg.settings_changed.connect(self.on_settings_changed)
             dlg.request_quit.connect(self.quit)
             self._settings_dialog = dlg
         else:
-            # 重新載入聲音清單與設定
             self._settings_dialog._voices = voices  # noqa: SLF001
             self._settings_dialog._populate_voices()  # noqa: SLF001
             self._settings_dialog._s = self.store.load()  # noqa: SLF001
@@ -819,81 +873,140 @@ class AppController(QtCore.QObject):
     def set_enabled(self, enabled: bool) -> None:
         self.settings.enabled = bool(enabled)
         self.store.save(self.settings)
+        self._tray.showMessage(APP_TITLE, f"已{'啟用' if enabled else '停用'}", QtWidgets.QSystemTrayIcon.Information, 1500)
         logging.info("enabled set to %s", enabled)
 
-    def on_ctrl_c(self) -> None:
-        self._last_ctrl_c_ts = time.monotonic()
+    def test_popup(self) -> None:
+        self.show_popup("There are many traffic lights on the street.")
 
+    # -------------------------
+    # Clipboard trigger
+    # -------------------------
     def on_clipboard_changed(self) -> None:
         if not self.settings.enabled:
             return
-        # [PATCH] disable-ctrlc-gate: clipboard-only trigger
-        # 原本的 Ctrl+C 時窗 gate 已停用，改為只要剪貼簿文字變更就觸發。
-
         text = (self.clipboard.text() or "").strip()
         if not text:
             return
         if len(text) > int(self.settings.max_chars):
             return
+        QtCore.QTimer.singleShot(60, lambda: self._show_if_still_same(text))
 
-        now = time.monotonic()
-        if text == self._last_shown_text and (now - self._last_shown_ts) < 0.8:
+    def _show_if_still_same(self, expected: str) -> None:
+        cur = (self.clipboard.text() or "").strip()
+        if cur != expected:
+            return
+        self.show_popup(cur)
+
+    # -------------------------
+    # Popup show + translate
+    # -------------------------
+    def show_popup(self, src_text: str) -> None:
+        self._stop_tts()
+        self.popup.set_playing(False)
+        self.popup.set_enabled_play(False)
+        self.popup.show_near_cursor(src_text=src_text, zh_text="")
+
+        src_lang = detect_lang(src_text)
+        if src_lang == "zh":
+            self.translation_ready.emit(src_text, src_text)
             return
 
-        self._last_shown_text = text
-        self._last_shown_ts = now
-        self.show_popup(text)
-
-    def show_popup(self, text: str) -> None:
-        self.popup.show_near_cursor(text=text, translated="", auto_hide_ms=self.settings.popup_auto_hide_ms)
-
-        src_lang = detect_lang(text)
-        if src_lang == "en":
-            sl, tl = "en", "zh-TW"
-        else:
-            sl, tl = "zh-TW", "en"
-
         th = threading.Thread(
-            target=self._translate_and_update,
-            args=(text, sl, tl, float(self.settings.translate_timeout_sec)),
+            target=self._translate_worker,
+            args=(src_text, float(self.settings.translate_timeout_sec)),
             daemon=True,
         )
         th.start()
 
-    def _translate_and_update(self, text: str, sl: str, tl: str, timeout: float) -> None:
-        translated = self.translator.translate(text, sl=sl, tl=tl, timeout_sec=timeout)
-        # 使用 Qt signal（跨 thread queued）回到 GUI thread 更新 UI
-        self.translation_ready.emit(text, translated)
+    def _translate_worker(self, src_text: str, timeout: float) -> None:
+        # 固定翻成 zh-TW（不顯示英文原文）
+        zh = self.translator.translate(src_text, sl="en", tl="zh-TW", timeout_sec=timeout)
+        self.translation_ready.emit(src_text, zh)
 
     @QtCore.Slot(str, str)
-    def on_translation_ready(self, text: str, translated: str) -> None:
-        if self.popup.isVisible() and self.popup.text == text:
-            self.popup.update_translation(translated)
+    def on_translation_ready(self, src_text: str, zh_text: str) -> None:
+        if not self.popup.isVisible() or self.popup.src_text != src_text:
+            return
+        self.popup.update_zh_text(zh_text if zh_text else "（翻譯失敗或被阻擋）")
+        self.popup.set_enabled_play(self._tts_available)
 
-    def on_translate_clicked(self) -> None:
-        if self.popup.text:
-            self.show_popup(self.popup.text)
-
-    def on_play_clicked(self) -> None:
-        text = self.popup.text.strip()
-        if not text:
+    # -------------------------
+    # Play/Stop toggle
+    # -------------------------
+    def on_play_toggle(self) -> None:
+        if not self.popup.isVisible():
+            return
+        if not self._tts_available or self._tts_worker is None:
             return
 
-        src_lang = detect_lang(text)
-        voice_id = self.settings.voice_zh_id if src_lang == "zh" else self.settings.voice_en_id
-        self._tts_worker.speak(text, voice_id)
+        if self.popup._playing:
+            self._stop_tts()
+            self.popup.set_playing(False)
+            return
 
+        zh = (self.popup.zh_text or "").strip()
+        if not zh or zh == "翻譯中…":
+            return
+
+        self._play_token += 1
+        tok = self._play_token
+        self.popup.set_playing(True)
+        self._tts_worker.speak(zh, self.settings.voice_zh_id, token=tok)
+
+    def _stop_tts(self) -> None:
+        try:
+            if self._tts_worker is not None:
+                self._tts_worker.stop()
+        except Exception:
+            pass
+
+    @QtCore.Slot(int)
+    def on_tts_finished(self, token: int) -> None:
+        if token == self._play_token:
+            self.popup.set_playing(False)
+
+    @QtCore.Slot(int)
+    def on_tts_stopped(self, token: int) -> None:
+        if token == self._play_token:
+            self.popup.set_playing(False)
+
+    def on_popup_closed(self) -> None:
+        self._stop_tts()
+        self.popup.set_playing(False)
+
+    # -------------------------
+    # Global close behavior
+    # -------------------------
+    @QtCore.Slot(int, int)
+    def on_global_click(self, x: int, y: int) -> None:
+        if self.popup.isVisible() and (not self.popup.contains_global_point(x, y)):
+            self.popup.hide_and_emit()
+
+    @QtCore.Slot()
+    def on_global_wheel(self) -> None:
+        if self.popup.isVisible():
+            self.popup.hide_and_emit()
+
+    # -------------------------
+    # Quit
+    # -------------------------
     def quit(self) -> None:
         try:
             self.popup.hide()
         except Exception:
             pass
         try:
-            self.hotkeys.stop()
+            self._stop_tts()
         except Exception:
             pass
         try:
-            self._tts_worker.quit()
+            if self._tts_worker is not None:
+                self._tts_worker.quit()
+        except Exception:
+            pass
+        try:
+            self.mouse_watcher.stop()
         except Exception:
             pass
         try:
@@ -904,38 +1017,12 @@ class AppController(QtCore.QObject):
         self.app.quit()
 
 
-def _ensure_dirs() -> None:
-    USER_DATA.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _guard_dependencies() -> Optional[str]:
-    if keyboard is None:
-        return "缺少 pynput（無法監聽 Ctrl+C）"
-    if win32com is None:
-        return "缺少 pywin32（無法使用 Windows 語音）"
-    return None
-
-
 def main() -> int:
     _ensure_dirs()
     setup_logging()
 
-    err = _guard_dependencies()
-    if err:
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-        QtWidgets.QMessageBox.critical(None, APP_TITLE, err + "\n\n請依 README 安裝相依套件後再執行。")
-        return 1
-
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.setQuitOnLastWindowClosed(False)
-
-    try:
-        QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-            QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-        )
-    except Exception:
-        pass
 
     _ = AppController(app)
     return app.exec()
