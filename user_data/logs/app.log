@@ -25,3 +25,29 @@
 2026-01-30 00:09:29,710 INFO settings updated: enabled=True
 2026-01-30 00:38:53,668 INFO === TTS翻譯 啟動 ===
 2026-01-30 00:38:53,714 INFO GlobalMouseWatcher started
+2026-01-30 00:41:06,069 INFO === TTS翻譯 啟動 ===
+2026-01-30 00:41:06,116 INFO GlobalMouseWatcher started
+2026-01-30 00:41:24,866 INFO enabled set to False
+2026-01-30 00:41:26,177 INFO enabled set to True
+2026-01-30 00:43:00,395 INFO === TTS翻譯 啟動 ===
+2026-01-30 00:43:00,441 INFO GlobalMouseWatcher started
+2026-01-30 00:43:06,507 INFO === TTS翻譯 結束 ===
+2026-01-30 00:43:11,216 INFO === TTS翻譯 啟動 ===
+2026-01-30 00:43:11,262 INFO GlobalMouseWatcher started
+2026-01-30 00:43:22,518 INFO === TTS翻譯 結束 ===
+2026-01-30 00:43:32,384 INFO === TTS翻譯 啟動 ===
+2026-01-30 00:43:32,431 INFO GlobalMouseWatcher started
+2026-01-30 00:57:22,334 INFO === TTS翻譯 啟動 ===
+2026-01-30 00:57:22,388 INFO GlobalMouseWatcher started
+2026-01-30 00:57:33,561 INFO runtime enabled set to False (not persisted)
+2026-01-30 00:57:33,567 INFO settings updated: runtime_enabled=False font_size=24 max_chars_per_line=18
+2026-01-30 00:57:42,870 INFO runtime enabled set to True (not persisted)
+2026-01-30 00:57:55,359 INFO runtime enabled set to True (not persisted)
+2026-01-30 00:57:55,365 INFO settings updated: runtime_enabled=True font_size=24 max_chars_per_line=10
+2026-01-30 00:57:59,178 INFO runtime enabled set to True (not persisted)
+2026-01-30 00:57:59,179 INFO settings updated: runtime_enabled=True font_size=24 max_chars_per_line=10
+2026-01-30 00:58:02,145 INFO runtime enabled set to True (not persisted)
+2026-01-30 00:58:02,147 INFO settings updated: runtime_enabled=True font_size=24 max_chars_per_line=10
+2026-01-30 00:58:18,215 INFO === TTS翻譯 啟動 ===
+2026-01-30 00:58:18,266 INFO GlobalMouseWatcher started
+2026-01-30 00:58:20,752 INFO runtime enabled set to True (not persisted)

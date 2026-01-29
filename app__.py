@@ -2,18 +2,16 @@
 """
 TTS翻譯（Windows / Win11）
 
-本版依需求調整：
-- 彈窗不再自動關閉（移除預設關閉時間）
-- 彈窗只顯示「翻譯後的中文」與「播放/停止」按鈕（不顯示英文原文）
-- 播放按鈕：按下切換為停止；按停止會立即停止播放（播放內容＝中文翻譯）
-- 任何滑鼠點擊只要不是點在彈窗上就關閉彈窗；滾輪事件也會關閉彈窗
-  - 這需要全域滑鼠監聽（pynput.mouse）。
+UI v3 變更：
+- 彈窗只顯示「翻譯後中文」+ 左側「播放/停止」按鈕（不顯示英文原文）
+- 播放內容改為「原文」：原文中文念中文、原文英文念英文（自動偵測）
+- 設定新增：字體大小、每行最多字數（超過就換行）
+- 啟用狀態每次啟動一律預設為「不啟用」，且不寫入 settings.json（不記住上次狀態）
+- 全域滑鼠：點擊非彈窗區域即關閉；滾輪也會關閉（需 pynput）
 
-觸發來源：剪貼簿文字變更（涵蓋 Ctrl+C/右鍵/選單複製）
+觸發來源：剪貼簿文字變更（涵蓋 Ctrl+C / 右鍵 / 選單複製）
 翻譯：translate.googleapis.com client=gtx（非官方端點）
 TTS：Windows SAPI（pywin32）
-
-依賴：PySide6 / pynput / pywin32
 """
 
 from __future__ import annotations
@@ -48,9 +46,15 @@ except Exception:
 
 
 APP_TITLE = "TTS翻譯"
-DEFAULT_ENABLED = False
+
+# 每次啟動都必須預設不啟用（且不記住上次）
+DEFAULT_ENABLED_RUNTIME = False
+
 DEFAULT_MAX_CHARS = 500
 DEFAULT_TRANSLATE_TIMEOUT_SEC = 6.0
+
+DEFAULT_FONT_SIZE = 24
+DEFAULT_MAX_CHARS_PER_LINE = 18
 
 # Theme（集中管理）
 ACCENT = "#72e3fd"
@@ -68,36 +72,56 @@ SETTINGS_PATH = USER_DATA / "settings.json"
 
 @dataclass
 class Settings:
-    enabled: bool = DEFAULT_ENABLED
-    voice_zh_id: str = ""  # SAPI token id；空字串 => 自動
-    voice_en_id: str = ""  # 保留但本版不播放英文
+    # enabled 為「runtime 狀態」，不落盤、不讀盤；每次啟動固定為 False
+    enabled: bool = DEFAULT_ENABLED_RUNTIME
+
+    # SAPI token id；空字串 => 自動
+    voice_zh_id: str = ""
+    voice_en_id: str = ""
+
     max_chars: int = DEFAULT_MAX_CHARS
     translate_timeout_sec: float = DEFAULT_TRANSLATE_TIMEOUT_SEC
 
+    font_size: int = DEFAULT_FONT_SIZE
+    max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE
+
 
 class SettingsStore:
+    """
+    注意：
+    - enabled 不寫入、不讀取（避免記住上次啟用狀態）
+    - 其他設定（語音/字體/換行/翻譯逾時/最長字數）會落盤
+    """
     def __init__(self, path: Path):
         self.path = path
         self._lock = threading.Lock()
 
     def load(self) -> Settings:
         with self._lock:
+            s = Settings(enabled=DEFAULT_ENABLED_RUNTIME)
             try:
                 if not self.path.exists():
-                    return Settings()
+                    return s
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-                s = Settings()
+                # 明確忽略 enabled
                 for k, v in data.items():
+                    if k == "enabled":
+                        continue
                     if hasattr(s, k):
                         setattr(s, k, v)
+                # runtime enabled 強制預設 false
+                s.enabled = DEFAULT_ENABLED_RUNTIME
                 return s
             except Exception:
-                return Settings()
+                return s
 
     def save(self, s: Settings) -> None:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(asdict(s), ensure_ascii=False, indent=2), encoding="utf-8")
+            data = asdict(s)
+            # 不保存 enabled
+            data.pop("enabled", None)
+            self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _ensure_dirs() -> None:
@@ -121,6 +145,10 @@ _RE_EN = re.compile(r"[A-Za-z]")
 
 
 def detect_lang(text: str) -> str:
+    """
+    回傳 "zh" 或 "en"
+    - 若中文字元 >= 英文字元 => zh，否則 en
+    """
     t = (text or "").strip()
     if not t:
         return "en"
@@ -129,6 +157,32 @@ def detect_lang(text: str) -> str:
     if zh == 0 and en == 0:
         return "en"
     return "zh" if zh >= en else "en"
+
+
+def wrap_by_max_chars(text: str, max_chars_per_line: int) -> str:
+    """
+    依「每行最多字數」硬換行（以字元數計）。
+    - 保留原有換行
+    - max_chars_per_line <= 0 視為不處理
+    """
+    if max_chars_per_line <= 0:
+        return text or ""
+    s = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    out: List[str] = []
+    n = 0
+    for ch in s:
+        if ch == "\n":
+            out.append("\n")
+            n = 0
+            continue
+        out.append(ch)
+        n += 1
+        if n >= max_chars_per_line:
+            out.append("\n")
+            n = 0
+    # 避免尾端多一個換行
+    res = "".join(out)
+    return res.rstrip("\n")
 
 
 class GoogleTranslator:
@@ -307,7 +361,7 @@ class SapiTTSWorker(threading.Thread):
                 try:
                     st = getattr(self._voice, "Status", None)
                     running = int(getattr(st, "RunningState", 0)) if st is not None else 0
-                    # 避免剛開始時 RunningState 還沒更新（短時間 0）造成誤判
+                    # 避免剛開始 RunningState 尚未更新造成誤判
                     if running == 0 and (time.monotonic() - self._speaking_since) > 0.15:
                         tok = self._current_token
                         self._speaking = False
@@ -439,6 +493,9 @@ class PopupWidget(QtWidgets.QWidget):
         self._text_zh = ""
         self._playing = False
 
+        self._font_size = DEFAULT_FONT_SIZE
+        self._max_chars_per_line = DEFAULT_MAX_CHARS_PER_LINE
+
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -476,6 +533,7 @@ class PopupWidget(QtWidgets.QWidget):
         self.setStyleSheet(self._style_sheet())
         self.set_playing(False)
         self.set_enabled_play(False)
+        self.apply_display_settings(self._font_size, self._max_chars_per_line)
 
     def _style_sheet(self) -> str:
         return f"""
@@ -483,12 +541,6 @@ class PopupWidget(QtWidgets.QWidget):
             background: rgba(20, 27, 45, 0.96);
             border: 1px solid {BORDER};
             border-radius: 20px;
-        }}
-        #lblZh {{
-            color: {TEXT};
-            font-size: 24px;
-            font-weight: 600;
-            line-height: 1.25;
         }}
         #btnPlay {{
             background: rgba(255,255,255,0.06);
@@ -527,6 +579,25 @@ class PopupWidget(QtWidgets.QWidget):
         p.end()
         return QtGui.QIcon(pm)
 
+    def apply_display_settings(self, font_size: int, max_chars_per_line: int) -> None:
+        self._font_size = int(font_size)
+        self._max_chars_per_line = int(max_chars_per_line)
+
+        f = self.lbl_zh.font()
+        # 用 pointSize 讓 DPI 下較一致；若取不到就 fallback
+        if self._font_size > 0:
+            f.setPointSize(self._font_size)
+        self.lbl_zh.setFont(f)
+        self._re_render_text()
+
+    def _re_render_text(self) -> None:
+        if self._text_zh:
+            shown = wrap_by_max_chars(self._text_zh, self._max_chars_per_line)
+            self.lbl_zh.setText(shown)
+        else:
+            self.lbl_zh.setText("翻譯中…")
+        self.adjustSize()
+
     def set_enabled_play(self, ok: bool) -> None:
         self.btn_play.setEnabled(bool(ok))
         self.btn_play.setToolTip("播放/停止" if ok else "翻譯中…")
@@ -539,8 +610,7 @@ class PopupWidget(QtWidgets.QWidget):
         self._text_src = src_text
         self._text_zh = zh_text
 
-        self.lbl_zh.setText(zh_text if zh_text else "翻譯中…")
-        self.adjustSize()
+        self._re_render_text()
 
         pos = QtGui.QCursor.pos()
         x = pos.x() + 18
@@ -559,8 +629,7 @@ class PopupWidget(QtWidgets.QWidget):
 
     def update_zh_text(self, zh_text: str) -> None:
         self._text_zh = zh_text
-        self.lbl_zh.setText(zh_text if zh_text else "（翻譯失敗或被阻擋）")
-        self.adjustSize()
+        self._re_render_text()
 
     def hide_and_emit(self) -> None:
         self.hide()
@@ -583,22 +652,33 @@ class PopupWidget(QtWidgets.QWidget):
 
 
 # -----------------------------
-# UI：設定視窗（語音選擇 + 啟用）
+# UI：設定視窗（語音 + 啟用 + 顯示）
 # -----------------------------
 class SettingsDialog(QtWidgets.QDialog):
     settings_changed = QtCore.Signal(Settings)
     request_quit = QtCore.Signal()
 
-    def __init__(self, parent: QtWidgets.QWidget, store: SettingsStore, sapi_voices: List[VoiceInfo], tts_available: bool):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget,
+        store: SettingsStore,
+        sapi_voices: List[VoiceInfo],
+        tts_available: bool,
+        runtime_enabled: bool,
+    ):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_TITLE}｜設定")
         self.setWindowModality(QtCore.Qt.NonModal)
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
 
         self._store = store
         self._voices = sapi_voices
         self._tts_available = tts_available
+
+        # 讀盤設定（不含 enabled）
         self._s = store.load()
+        # runtime enabled 以參數為準（每次啟動預設 False）
+        self._s.enabled = bool(runtime_enabled)
 
         self._build_ui()
         self._apply_theme()
@@ -654,18 +734,37 @@ class SettingsDialog(QtWidgets.QDialog):
         self.chk_enabled = QtWidgets.QCheckBox("啟用（剪貼簿文字變更時顯示彈窗）")
         lay.addWidget(self.chk_enabled)
 
-        grp_voice = QtWidgets.QGroupBox("中文語音（播放翻譯）")
+        grp_voice = QtWidgets.QGroupBox("語音（朗讀原文：自動判斷中文/英文）")
         vlay = QtWidgets.QFormLayout(grp_voice)
         vlay.setContentsMargins(12, 12, 12, 12)
         vlay.setSpacing(10)
 
         self.cmb_zh = QtWidgets.QComboBox()
+        self.cmb_en = QtWidgets.QComboBox()
         self.lbl_tts_state = QtWidgets.QLabel("")
         self.lbl_tts_state.setStyleSheet(f"color: {MUTED};")
 
         vlay.addRow("中文語音（zh-*）：", self.cmb_zh)
+        vlay.addRow("英文語音（en-*）：", self.cmb_en)
         vlay.addRow("TTS 狀態：", self.lbl_tts_state)
         lay.addWidget(grp_voice)
+
+        grp_display = QtWidgets.QGroupBox("顯示")
+        dlay = QtWidgets.QFormLayout(grp_display)
+        dlay.setContentsMargins(12, 12, 12, 12)
+        dlay.setSpacing(10)
+
+        self.spn_font = QtWidgets.QSpinBox()
+        self.spn_font.setRange(12, 72)
+        self.spn_font.setSingleStep(1)
+
+        self.spn_line = QtWidgets.QSpinBox()
+        self.spn_line.setRange(6, 80)
+        self.spn_line.setSingleStep(1)
+
+        dlay.addRow("字體大小：", self.spn_font)
+        dlay.addRow("每行最多字數：", self.spn_line)
+        lay.addWidget(grp_display)
 
         grp_misc = QtWidgets.QGroupBox("翻譯")
         mlay = QtWidgets.QFormLayout(grp_misc)
@@ -708,30 +807,49 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _populate_voices(self) -> None:
         self.cmb_zh.clear()
+        self.cmb_en.clear()
+
         if not self._voices:
             self.cmb_zh.addItem("（未偵測到語音；請安裝 pywin32 / Windows 語音）", userData="")
+            self.cmb_en.addItem("（未偵測到語音；請安裝 pywin32 / Windows 語音）", userData="")
             return
+
         zh = [v for v in self._voices if v.group == "zh"] or self._voices[:]
+        en = [v for v in self._voices if v.group == "en"] or self._voices[:]
+
         self.cmb_zh.addItem("（自動選擇）", userData="")
         for v in zh:
             self.cmb_zh.addItem(v.description, userData=v.token_id)
+
+        self.cmb_en.addItem("（自動選擇）", userData="")
+        for v in en:
+            self.cmb_en.addItem(v.description, userData=v.token_id)
 
     def _load_to_ui(self) -> None:
         s = self._s
         self.chk_enabled.setChecked(bool(s.enabled))
         self.dsp_timeout.setValue(float(s.translate_timeout_sec))
         self.spn_max.setValue(int(s.max_chars))
+        self.spn_font.setValue(int(s.font_size))
+        self.spn_line.setValue(int(s.max_chars_per_line))
+
         idx = self.cmb_zh.findData(s.voice_zh_id)
         self.cmb_zh.setCurrentIndex(idx if idx >= 0 else 0)
 
+        idx = self.cmb_en.findData(s.voice_en_id)
+        self.cmb_en.setCurrentIndex(idx if idx >= 0 else 0)
+
     def _on_save(self) -> None:
         s = Settings(
-            enabled=self.chk_enabled.isChecked(),
+            enabled=self.chk_enabled.isChecked(),  # runtime only（不落盤）
             voice_zh_id=str(self.cmb_zh.currentData() or ""),
-            voice_en_id=self._s.voice_en_id,
+            voice_en_id=str(self.cmb_en.currentData() or ""),
             max_chars=int(self.spn_max.value()),
             translate_timeout_sec=float(self.dsp_timeout.value()),
+            font_size=int(self.spn_font.value()),
+            max_chars_per_line=int(self.spn_line.value()),
         )
+        # store.save 會忽略 enabled
         self._store.save(s)
         self._s = s
         self.settings_changed.emit(s)
@@ -747,7 +865,11 @@ class AppController(QtCore.QObject):
         super().__init__()
         self.app = app
         self.store = SettingsStore(SETTINGS_PATH)
+
+        # 讀盤設定（不含 enabled），runtime enabled 強制 False
         self.settings = self.store.load()
+        self.runtime_enabled = DEFAULT_ENABLED_RUNTIME
+        self.settings.enabled = self.runtime_enabled
 
         self.translator = GoogleTranslator()
 
@@ -785,8 +907,12 @@ class AppController(QtCore.QObject):
         self._settings_dialog: Optional[SettingsDialog] = None
         self._tray = self._create_tray()
 
-        if not self.settings.enabled:
-            self._tray.showMessage(APP_TITLE, "已啟動（預設未啟用）。右鍵系統匣圖示 → 勾選「啟用」。", QtWidgets.QSystemTrayIcon.Information, 4000)
+        # 套用顯示設定到彈窗
+        self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
+
+        # 啟動提示（預設不啟用）
+        self._tray.showMessage(APP_TITLE, "已啟動（本次執行預設未啟用；不記住上次狀態）。右鍵系統匣圖示 → 勾選「啟用」。", QtWidgets.QSystemTrayIcon.Information, 4500)
+
         if mouse is None:
             self._tray.showMessage(APP_TITLE, "提示：未安裝 pynput，無法做到「點擊/滾輪在任何地方關閉彈窗」。", QtWidgets.QSystemTrayIcon.Warning, 4500)
         if not self._tts_available:
@@ -800,7 +926,8 @@ class AppController(QtCore.QObject):
 
         self.act_enabled = QtGui.QAction("啟用", menu)
         self.act_enabled.setCheckable(True)
-        self.act_enabled.setChecked(bool(self.settings.enabled))
+        # 每次啟動一律 False
+        self.act_enabled.setChecked(False)
         self.act_enabled.toggled.connect(self.set_enabled)
 
         act_settings = QtGui.QAction("設定…", menu)
@@ -851,14 +978,22 @@ class AppController(QtCore.QObject):
     def open_settings(self) -> None:
         voices = SapiVoiceManager.list_voices()
         if not self._settings_dialog:
-            dlg = SettingsDialog(None, self.store, voices, tts_available=self._tts_available)
+            dlg = SettingsDialog(
+                None,
+                self.store,
+                voices,
+                tts_available=self._tts_available,
+                runtime_enabled=self.runtime_enabled,
+            )
             dlg.settings_changed.connect(self.on_settings_changed)
             dlg.request_quit.connect(self.quit)
             self._settings_dialog = dlg
         else:
             self._settings_dialog._voices = voices  # noqa: SLF001
             self._settings_dialog._populate_voices()  # noqa: SLF001
-            self._settings_dialog._s = self.store.load()  # noqa: SLF001
+            s = self.store.load()
+            s.enabled = self.runtime_enabled
+            self._settings_dialog._s = s  # noqa: SLF001
             self._settings_dialog._load_to_ui()  # noqa: SLF001
 
         self._settings_dialog.show()
@@ -866,15 +1001,27 @@ class AppController(QtCore.QObject):
         self._settings_dialog.activateWindow()
 
     def on_settings_changed(self, s: Settings) -> None:
-        self.settings = s
-        self.act_enabled.setChecked(bool(s.enabled))
-        logging.info("settings updated: enabled=%s", s.enabled)
+        # enabled 為 runtime
+        self.set_enabled(bool(s.enabled))
+
+        # 其餘設定以 store.load() 為主（因 store.save 不含 enabled）
+        self.settings = self.store.load()
+        self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
+
+        logging.info(
+            "settings updated: runtime_enabled=%s font_size=%s max_chars_per_line=%s",
+            self.runtime_enabled, self.settings.font_size, self.settings.max_chars_per_line
+        )
 
     def set_enabled(self, enabled: bool) -> None:
-        self.settings.enabled = bool(enabled)
-        self.store.save(self.settings)
-        self._tray.showMessage(APP_TITLE, f"已{'啟用' if enabled else '停用'}", QtWidgets.QSystemTrayIcon.Information, 1500)
-        logging.info("enabled set to %s", enabled)
+        # runtime only（不落盤）
+        self.runtime_enabled = bool(enabled)
+        self.settings.enabled = self.runtime_enabled
+        self.act_enabled.blockSignals(True)
+        self.act_enabled.setChecked(self.runtime_enabled)
+        self.act_enabled.blockSignals(False)
+        self._tray.showMessage(APP_TITLE, f"已{'啟用' if enabled else '停用'}（本次執行，不會記住）", QtWidgets.QSystemTrayIcon.Information, 1500)
+        logging.info("runtime enabled set to %s (not persisted)", enabled)
 
     def test_popup(self) -> None:
         self.show_popup("There are many traffic lights on the street.")
@@ -883,7 +1030,7 @@ class AppController(QtCore.QObject):
     # Clipboard trigger
     # -------------------------
     def on_clipboard_changed(self) -> None:
-        if not self.settings.enabled:
+        if not self.runtime_enabled:
             return
         text = (self.clipboard.text() or "").strip()
         if not text:
@@ -905,13 +1052,18 @@ class AppController(QtCore.QObject):
         self._stop_tts()
         self.popup.set_playing(False)
         self.popup.set_enabled_play(False)
+        self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
+
+        # 先顯示彈窗（中文尚未準備好）
         self.popup.show_near_cursor(src_text=src_text, zh_text="")
 
         src_lang = detect_lang(src_text)
         if src_lang == "zh":
+            # 中文原文：顯示中文（等同翻譯）並可播放（朗讀原文中文）
             self.translation_ready.emit(src_text, src_text)
             return
 
+        # 英文原文：翻成中文顯示（朗讀仍念英文原文）
         th = threading.Thread(
             target=self._translate_worker,
             args=(src_text, float(self.settings.translate_timeout_sec)),
@@ -920,7 +1072,6 @@ class AppController(QtCore.QObject):
         th.start()
 
     def _translate_worker(self, src_text: str, timeout: float) -> None:
-        # 固定翻成 zh-TW（不顯示英文原文）
         zh = self.translator.translate(src_text, sl="en", tl="zh-TW", timeout_sec=timeout)
         self.translation_ready.emit(src_text, zh)
 
@@ -929,10 +1080,11 @@ class AppController(QtCore.QObject):
         if not self.popup.isVisible() or self.popup.src_text != src_text:
             return
         self.popup.update_zh_text(zh_text if zh_text else "（翻譯失敗或被阻擋）")
+        # 翻譯結束（成功或失敗）都允許播放「原文」
         self.popup.set_enabled_play(self._tts_available)
 
     # -------------------------
-    # Play/Stop toggle
+    # Play/Stop toggle（朗讀原文）
     # -------------------------
     def on_play_toggle(self) -> None:
         if not self.popup.isVisible():
@@ -945,14 +1097,17 @@ class AppController(QtCore.QObject):
             self.popup.set_playing(False)
             return
 
-        zh = (self.popup.zh_text or "").strip()
-        if not zh or zh == "翻譯中…":
+        src = (self.popup.src_text or "").strip()
+        if not src:
             return
+
+        lang = detect_lang(src)
+        voice_id = self.settings.voice_zh_id if lang == "zh" else self.settings.voice_en_id
 
         self._play_token += 1
         tok = self._play_token
         self.popup.set_playing(True)
-        self._tts_worker.speak(zh, self.settings.voice_zh_id, token=tok)
+        self._tts_worker.speak(src, voice_id, token=tok)
 
     def _stop_tts(self) -> None:
         try:
@@ -980,11 +1135,13 @@ class AppController(QtCore.QObject):
     # -------------------------
     @QtCore.Slot(int, int)
     def on_global_click(self, x: int, y: int) -> None:
+        # 只要不是點在彈窗上 => 關閉
         if self.popup.isVisible() and (not self.popup.contains_global_point(x, y)):
             self.popup.hide_and_emit()
 
     @QtCore.Slot()
     def on_global_wheel(self) -> None:
+        # 任何滾輪事件 => 關閉
         if self.popup.isVisible():
             self.popup.hide_and_emit()
 
