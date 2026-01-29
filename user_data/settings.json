@@ -1,8 +1,9 @@
 {
   "voice_zh_id": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_ZH-TW_HANHAN_11.0",
-  "voice_en_id": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_DAVID_11.0",
+  "voice_en_id": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_ZIRA_11.0",
   "max_chars": 1000,
   "translate_timeout_sec": 6.0,
   "font_size": 24,
-  "max_chars_per_line": 10
+  "max_chars_per_line": 10,
+  "popup_position_mode": "window_center"
 }

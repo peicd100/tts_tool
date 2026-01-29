@@ -2,11 +2,14 @@
 """
 TTS翻譯（Windows / Win11）
 
-UI v3 變更：
-- 彈窗只顯示「翻譯後中文」+ 左側「播放/停止」按鈕（不顯示英文原文）
-- 播放內容改為「原文」：原文中文念中文、原文英文念英文（自動偵測）
-- 設定新增：字體大小、每行最多字數（超過就換行）
-- 啟用狀態每次啟動一律預設為「不啟用」，且不寫入 settings.json（不記住上次狀態）
+UI v4 變更：
+- 朗讀改為「原文」：原文中文念中文、原文英文念英文（自動偵測）
+- 彈窗仍只顯示「翻譯後中文」與「播放/停止」按鈕（不顯示英文原文）
+- 設定新增：字體大小（修正會被還原的 bug：改用 pixelSize + QSS 兩道保險）、每行最多字數（超過硬換行）
+- 設定新增：彈窗位置
+  - 滑鼠旁邊
+  - 滑鼠所在視窗正中心（需 pywin32 的 win32gui；不可用時自動退回螢幕中心）
+- 啟用狀態每次啟動一律預設「不啟用」，且不記住上次狀態（enabled 不落盤）
 - 全域滑鼠：點擊非彈窗區域即關閉；滾輪也會關閉（需 pynput）
 
 觸發來源：剪貼簿文字變更（涵蓋 Ctrl+C / 右鍵 / 選單複製）
@@ -36,13 +39,20 @@ try:
 except Exception:
     mouse = None  # type: ignore
 
-# pywin32：Windows SAPI TTS
+# pywin32：Windows SAPI TTS +（選用）取得滑鼠所在視窗 rect
 try:
     import win32com.client  # type: ignore
     import pythoncom  # type: ignore
 except Exception:
     win32com = None  # type: ignore
     pythoncom = None  # type: ignore
+
+try:
+    import win32gui  # type: ignore
+    import win32con  # type: ignore
+except Exception:
+    win32gui = None  # type: ignore
+    win32con = None  # type: ignore
 
 
 APP_TITLE = "TTS翻譯"
@@ -55,6 +65,11 @@ DEFAULT_TRANSLATE_TIMEOUT_SEC = 6.0
 
 DEFAULT_FONT_SIZE = 24
 DEFAULT_MAX_CHARS_PER_LINE = 18
+
+# 彈窗位置模式
+POS_CURSOR = "cursor"
+POS_WINDOW_CENTER = "window_center"
+DEFAULT_POSITION_MODE = POS_CURSOR
 
 # Theme（集中管理）
 ACCENT = "#72e3fd"
@@ -85,12 +100,14 @@ class Settings:
     font_size: int = DEFAULT_FONT_SIZE
     max_chars_per_line: int = DEFAULT_MAX_CHARS_PER_LINE
 
+    popup_position_mode: str = DEFAULT_POSITION_MODE
+
 
 class SettingsStore:
     """
     注意：
     - enabled 不寫入、不讀取（避免記住上次啟用狀態）
-    - 其他設定（語音/字體/換行/翻譯逾時/最長字數）會落盤
+    - 其他設定（語音/字體/換行/位置/翻譯逾時/最長字數）會落盤
     """
     def __init__(self, path: Path):
         self.path = path
@@ -103,7 +120,6 @@ class SettingsStore:
                 if not self.path.exists():
                     return s
                 data = json.loads(self.path.read_text(encoding="utf-8"))
-                # 明確忽略 enabled
                 for k, v in data.items():
                     if k == "enabled":
                         continue
@@ -111,6 +127,9 @@ class SettingsStore:
                         setattr(s, k, v)
                 # runtime enabled 強制預設 false
                 s.enabled = DEFAULT_ENABLED_RUNTIME
+                # 防呆：位置模式值不合法時回到預設
+                if s.popup_position_mode not in (POS_CURSOR, POS_WINDOW_CENTER):
+                    s.popup_position_mode = DEFAULT_POSITION_MODE
                 return s
             except Exception:
                 return s
@@ -119,7 +138,6 @@ class SettingsStore:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             data = asdict(s)
-            # 不保存 enabled
             data.pop("enabled", None)
             self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -180,7 +198,6 @@ def wrap_by_max_chars(text: str, max_chars_per_line: int) -> str:
         if n >= max_chars_per_line:
             out.append("\n")
             n = 0
-    # 避免尾端多一個換行
     res = "".join(out)
     return res.rstrip("\n")
 
@@ -361,7 +378,6 @@ class SapiTTSWorker(threading.Thread):
                 try:
                     st = getattr(self._voice, "Status", None)
                     running = int(getattr(st, "RunningState", 0)) if st is not None else 0
-                    # 避免剛開始 RunningState 尚未更新造成誤判
                     if running == 0 and (time.monotonic() - self._speaking_since) > 0.15:
                         tok = self._current_token
                         self._speaking = False
@@ -471,6 +487,32 @@ class GlobalMouseWatcher(QtCore.QObject):
 
 
 # -----------------------------
+# 位置計算（滑鼠旁邊 / 滑鼠所在視窗正中心）
+# -----------------------------
+def get_top_level_window_rect_at(x: int, y: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    取得「滑鼠所在的 top-level 視窗」Rect (L, T, R, B)
+    - 需要 win32gui / win32con
+    - 失敗回傳 None
+    """
+    if win32gui is None or win32con is None:
+        return None
+    try:
+        hwnd = win32gui.WindowFromPoint((int(x), int(y)))
+        if not hwnd:
+            return None
+        hwnd_root = win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
+        if hwnd_root:
+            hwnd = hwnd_root
+        l, t, r, b = win32gui.GetWindowRect(hwnd)
+        if r <= l or b <= t:
+            return None
+        return int(l), int(t), int(r), int(b)
+    except Exception:
+        return None
+
+
+# -----------------------------
 # UI：Popup（只顯示中文翻譯 + 播放/停止）
 # -----------------------------
 class PopupWidget(QtWidgets.QWidget):
@@ -533,6 +575,8 @@ class PopupWidget(QtWidgets.QWidget):
         self.setStyleSheet(self._style_sheet())
         self.set_playing(False)
         self.set_enabled_play(False)
+
+        # 初始化字體設定（兩道保險）
         self.apply_display_settings(self._font_size, self._max_chars_per_line)
 
     def _style_sheet(self) -> str:
@@ -580,14 +624,19 @@ class PopupWidget(QtWidgets.QWidget):
         return QtGui.QIcon(pm)
 
     def apply_display_settings(self, font_size: int, max_chars_per_line: int) -> None:
-        self._font_size = int(font_size)
-        self._max_chars_per_line = int(max_chars_per_line)
+        self._font_size = max(10, int(font_size))
+        self._max_chars_per_line = max(1, int(max_chars_per_line))
 
+        # 1) pixelSize：避免 pointSize 被外部 style/DPI 還原
         f = self.lbl_zh.font()
-        # 用 pointSize 讓 DPI 下較一致；若取不到就 fallback
-        if self._font_size > 0:
-            f.setPointSize(self._font_size)
+        f.setPixelSize(self._font_size)
         self.lbl_zh.setFont(f)
+
+        # 2) QLabel 專屬 QSS：再加一道 font-size(px)
+        self.lbl_zh.setStyleSheet(
+            f"color: {TEXT}; font-size: {self._font_size}px; font-weight: 600;"
+        )
+
         self._re_render_text()
 
     def _re_render_text(self) -> None:
@@ -600,32 +649,54 @@ class PopupWidget(QtWidgets.QWidget):
 
     def set_enabled_play(self, ok: bool) -> None:
         self.btn_play.setEnabled(bool(ok))
-        self.btn_play.setToolTip("播放/停止" if ok else "翻譯中…")
+        self.btn_play.setToolTip("播放/停止" if ok else "TTS 不可用")
 
     def set_playing(self, playing: bool) -> None:
         self._playing = bool(playing)
         self.btn_play.setIcon(self._icon_stop() if self._playing else self._icon_play())
 
-    def show_near_cursor(self, src_text: str, zh_text: str) -> None:
+    def show_popup(self, src_text: str, zh_text: str, position_mode: str) -> None:
         self._text_src = src_text
         self._text_zh = zh_text
-
         self._re_render_text()
+        self._move_by_mode(position_mode)
+        self.show()
 
+    def _move_by_mode(self, position_mode: str) -> None:
         pos = QtGui.QCursor.pos()
-        x = pos.x() + 18
-        y = pos.y() + 18
+        cx, cy = int(pos.x()), int(pos.y())
 
         screen = QtGui.QGuiApplication.screenAt(pos) or QtGui.QGuiApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            if x + self.width() > geo.right():
-                x = max(geo.left(), geo.right() - self.width())
-            if y + self.height() > geo.bottom():
-                y = max(geo.top(), geo.bottom() - self.height())
+        geo = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1920, 1080)
 
-        self.move(x, y)
-        self.show()
+        if position_mode == POS_WINDOW_CENTER:
+            rect = get_top_level_window_rect_at(cx, cy)
+            if rect is not None:
+                l, t, r, b = rect
+                center_x = (l + r) // 2
+                center_y = (t + b) // 2
+                x = center_x - self.width() // 2
+                y = center_y - self.height() // 2
+            else:
+                # fallback：螢幕中心
+                x = geo.center().x() - self.width() // 2
+                y = geo.center().y() - self.height() // 2
+        else:
+            # POS_CURSOR：滑鼠旁邊
+            x = cx + 18
+            y = cy + 18
+
+        # constrain to screen
+        if x + self.width() > geo.right():
+            x = max(geo.left(), geo.right() - self.width())
+        if y + self.height() > geo.bottom():
+            y = max(geo.top(), geo.bottom() - self.height())
+        if x < geo.left():
+            x = geo.left()
+        if y < geo.top():
+            y = geo.top()
+
+        self.move(int(x), int(y))
 
     def update_zh_text(self, zh_text: str) -> None:
         self._text_zh = zh_text
@@ -646,13 +717,9 @@ class PopupWidget(QtWidgets.QWidget):
     def src_text(self) -> str:
         return self._text_src
 
-    @property
-    def zh_text(self) -> str:
-        return self._text_zh
-
 
 # -----------------------------
-# UI：設定視窗（語音 + 啟用 + 顯示）
+# UI：設定視窗（語音 + 啟用 + 顯示/位置）
 # -----------------------------
 class SettingsDialog(QtWidgets.QDialog):
     settings_changed = QtCore.Signal(Settings)
@@ -669,15 +736,13 @@ class SettingsDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_TITLE}｜設定")
         self.setWindowModality(QtCore.Qt.NonModal)
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(600)
 
         self._store = store
         self._voices = sapi_voices
         self._tts_available = tts_available
 
-        # 讀盤設定（不含 enabled）
         self._s = store.load()
-        # runtime enabled 以參數為準（每次啟動預設 False）
         self._s.enabled = bool(runtime_enabled)
 
         self._build_ui()
@@ -752,7 +817,7 @@ class SettingsDialog(QtWidgets.QDialog):
         grp_display = QtWidgets.QGroupBox("顯示")
         dlay = QtWidgets.QFormLayout(grp_display)
         dlay.setContentsMargins(12, 12, 12, 12)
-        dlay.setSpacing(10)
+        dlay.set_spacing = 10
 
         self.spn_font = QtWidgets.QSpinBox()
         self.spn_font.setRange(12, 72)
@@ -762,8 +827,17 @@ class SettingsDialog(QtWidgets.QDialog):
         self.spn_line.setRange(6, 80)
         self.spn_line.setSingleStep(1)
 
+        self.cmb_pos = QtWidgets.QComboBox()
+        self.cmb_pos.addItem("滑鼠旁邊", userData=POS_CURSOR)
+        self.cmb_pos.addItem("滑鼠所在視窗正中心", userData=POS_WINDOW_CENTER)
+
+        self.lbl_pos_hint = QtWidgets.QLabel("")
+        self.lbl_pos_hint.setStyleSheet(f"color: {MUTED};")
+
         dlay.addRow("字體大小：", self.spn_font)
         dlay.addRow("每行最多字數：", self.spn_line)
+        dlay.addRow("彈窗位置：", self.cmb_pos)
+        dlay.addRow("提示：", self.lbl_pos_hint)
         lay.addWidget(grp_display)
 
         grp_misc = QtWidgets.QGroupBox("翻譯")
@@ -804,6 +878,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self._populate_voices()
 
         self.lbl_tts_state.setText("可用" if self._tts_available else "不可用（未安裝 pywin32 或 SAPI 初始化失敗）")
+        if self._tts_available and (win32gui is None or win32con is None):
+            self.lbl_pos_hint.setText("「視窗正中心」需要 win32gui（pywin32）；目前不可用，將自動退回螢幕中心。")
+        else:
+            self.lbl_pos_hint.setText("「滑鼠旁邊」更像翻譯泡泡；「視窗正中心」適合固定閱讀。")
 
     def _populate_voices(self) -> None:
         self.cmb_zh.clear()
@@ -839,6 +917,9 @@ class SettingsDialog(QtWidgets.QDialog):
         idx = self.cmb_en.findData(s.voice_en_id)
         self.cmb_en.setCurrentIndex(idx if idx >= 0 else 0)
 
+        idx = self.cmb_pos.findData(s.popup_position_mode)
+        self.cmb_pos.setCurrentIndex(idx if idx >= 0 else 0)
+
     def _on_save(self) -> None:
         s = Settings(
             enabled=self.chk_enabled.isChecked(),  # runtime only（不落盤）
@@ -848,8 +929,8 @@ class SettingsDialog(QtWidgets.QDialog):
             translate_timeout_sec=float(self.dsp_timeout.value()),
             font_size=int(self.spn_font.value()),
             max_chars_per_line=int(self.spn_line.value()),
+            popup_position_mode=str(self.cmb_pos.currentData() or DEFAULT_POSITION_MODE),
         )
-        # store.save 會忽略 enabled
         self._store.save(s)
         self._s = s
         self.settings_changed.emit(s)
@@ -866,7 +947,6 @@ class AppController(QtCore.QObject):
         self.app = app
         self.store = SettingsStore(SETTINGS_PATH)
 
-        # 讀盤設定（不含 enabled），runtime enabled 強制 False
         self.settings = self.store.load()
         self.runtime_enabled = DEFAULT_ENABLED_RUNTIME
         self.settings.enabled = self.runtime_enabled
@@ -907,16 +987,23 @@ class AppController(QtCore.QObject):
         self._settings_dialog: Optional[SettingsDialog] = None
         self._tray = self._create_tray()
 
-        # 套用顯示設定到彈窗
-        self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
+        self.apply_popup_settings()
 
-        # 啟動提示（預設不啟用）
-        self._tray.showMessage(APP_TITLE, "已啟動（本次執行預設未啟用；不記住上次狀態）。右鍵系統匣圖示 → 勾選「啟用」。", QtWidgets.QSystemTrayIcon.Information, 4500)
+        self._tray.showMessage(
+            APP_TITLE,
+            "已啟動（本次執行預設未啟用；不記住上次狀態）。右鍵系統匣圖示 → 勾選「啟用」。",
+            QtWidgets.QSystemTrayIcon.Information,
+            4500,
+        )
 
         if mouse is None:
             self._tray.showMessage(APP_TITLE, "提示：未安裝 pynput，無法做到「點擊/滾輪在任何地方關閉彈窗」。", QtWidgets.QSystemTrayIcon.Warning, 4500)
         if not self._tts_available:
             self._tray.showMessage(APP_TITLE, "提示：未安裝 pywin32 或 SAPI 不可用，播放功能將無法使用。", QtWidgets.QSystemTrayIcon.Warning, 4500)
+
+    def apply_popup_settings(self) -> None:
+        self.settings = self.store.load()
+        self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
 
     def _create_tray(self) -> QtWidgets.QSystemTrayIcon:
         tray = QtWidgets.QSystemTrayIcon(self._make_tray_icon(), self.app)
@@ -926,7 +1013,6 @@ class AppController(QtCore.QObject):
 
         self.act_enabled = QtGui.QAction("啟用", menu)
         self.act_enabled.setCheckable(True)
-        # 每次啟動一律 False
         self.act_enabled.setChecked(False)
         self.act_enabled.toggled.connect(self.set_enabled)
 
@@ -963,7 +1049,7 @@ class AppController(QtCore.QObject):
         pen = QtGui.QPen(QtGui.QColor(114, 227, 253, 255))
         pen.setWidth(4)
         p.setPen(pen)
-        p.setBrush(QtCore.Qt.NoBrush)
+        p.setBrush(QtGui.QColor(114, 227, 253, 70))
         p.drawEllipse(12, 12, size - 24, size - 24)
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(QtGui.QColor(114, 227, 253, 255))
@@ -1001,22 +1087,15 @@ class AppController(QtCore.QObject):
         self._settings_dialog.activateWindow()
 
     def on_settings_changed(self, s: Settings) -> None:
-        # enabled 為 runtime
         self.set_enabled(bool(s.enabled))
-
-        # 其餘設定以 store.load() 為主（因 store.save 不含 enabled）
-        self.settings = self.store.load()
-        self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
-
+        self.apply_popup_settings()
         logging.info(
-            "settings updated: runtime_enabled=%s font_size=%s max_chars_per_line=%s",
-            self.runtime_enabled, self.settings.font_size, self.settings.max_chars_per_line
+            "settings updated: runtime_enabled=%s font_size=%s max_chars_per_line=%s pos=%s",
+            self.runtime_enabled, self.settings.font_size, self.settings.max_chars_per_line, self.settings.popup_position_mode
         )
 
     def set_enabled(self, enabled: bool) -> None:
-        # runtime only（不落盤）
         self.runtime_enabled = bool(enabled)
-        self.settings.enabled = self.runtime_enabled
         self.act_enabled.blockSignals(True)
         self.act_enabled.setChecked(self.runtime_enabled)
         self.act_enabled.blockSignals(False)
@@ -1026,9 +1105,6 @@ class AppController(QtCore.QObject):
     def test_popup(self) -> None:
         self.show_popup("There are many traffic lights on the street.")
 
-    # -------------------------
-    # Clipboard trigger
-    # -------------------------
     def on_clipboard_changed(self) -> None:
         if not self.runtime_enabled:
             return
@@ -1045,25 +1121,22 @@ class AppController(QtCore.QObject):
             return
         self.show_popup(cur)
 
-    # -------------------------
-    # Popup show + translate
-    # -------------------------
     def show_popup(self, src_text: str) -> None:
         self._stop_tts()
         self.popup.set_playing(False)
-        self.popup.set_enabled_play(False)
-        self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
 
-        # 先顯示彈窗（中文尚未準備好）
-        self.popup.show_near_cursor(src_text=src_text, zh_text="")
+        # 即使翻譯未完成，也允許播放「原文」
+        self.popup.set_enabled_play(self._tts_available)
+
+        self.apply_popup_settings()
+
+        self.popup.show_popup(src_text=src_text, zh_text="", position_mode=self.settings.popup_position_mode)
 
         src_lang = detect_lang(src_text)
         if src_lang == "zh":
-            # 中文原文：顯示中文（等同翻譯）並可播放（朗讀原文中文）
             self.translation_ready.emit(src_text, src_text)
             return
 
-        # 英文原文：翻成中文顯示（朗讀仍念英文原文）
         th = threading.Thread(
             target=self._translate_worker,
             args=(src_text, float(self.settings.translate_timeout_sec)),
@@ -1080,12 +1153,7 @@ class AppController(QtCore.QObject):
         if not self.popup.isVisible() or self.popup.src_text != src_text:
             return
         self.popup.update_zh_text(zh_text if zh_text else "（翻譯失敗或被阻擋）")
-        # 翻譯結束（成功或失敗）都允許播放「原文」
-        self.popup.set_enabled_play(self._tts_available)
 
-    # -------------------------
-    # Play/Stop toggle（朗讀原文）
-    # -------------------------
     def on_play_toggle(self) -> None:
         if not self.popup.isVisible():
             return
@@ -1130,24 +1198,16 @@ class AppController(QtCore.QObject):
         self._stop_tts()
         self.popup.set_playing(False)
 
-    # -------------------------
-    # Global close behavior
-    # -------------------------
     @QtCore.Slot(int, int)
     def on_global_click(self, x: int, y: int) -> None:
-        # 只要不是點在彈窗上 => 關閉
         if self.popup.isVisible() and (not self.popup.contains_global_point(x, y)):
             self.popup.hide_and_emit()
 
     @QtCore.Slot()
     def on_global_wheel(self) -> None:
-        # 任何滾輪事件 => 關閉
         if self.popup.isVisible():
             self.popup.hide_and_emit()
 
-    # -------------------------
-    # Quit
-    # -------------------------
     def quit(self) -> None:
         try:
             self.popup.hide()
