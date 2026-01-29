@@ -1,135 +1,175 @@
 # TTS翻譯
 
-## (1) 專案簡述
-這是一個常駐工作列（系統匣）的 Windows 小工具：當你在任何地方按下 `Ctrl+C` 複製文字後，它會在滑鼠旁邊跳出一個小彈窗，提供：
-- 自動翻譯（依內容自動判斷中/英文，決定譯向）
-- 一鍵播放（依內容自動判斷中/英文，使用對應語音播放原文）
-- 系統匣左鍵點擊可開啟設定：選擇英文/中文語音、啟用/停用（預設不啟用）、結束程式
+## (1) 專案概述
+本專案是一個 Windows 11 常駐系統匣（工作列右下角）的桌面小工具：啟用後，當你在任何地方複製文字（通常是 `Ctrl+C`，也包含右鍵/選單複製）且剪貼簿文字變更時，會在滑鼠旁彈出小視窗，提供：
+- **即時翻譯**：自動判斷中/英文並決定譯向
+- **一鍵播放原文（TTS）**：自動判斷中/英文並用對應語音播放（Windows SAPI；需 `pywin32`）
+- **系統匣左鍵**：開啟設定（選擇中/英文語音、啟用/停用、結束程式）
+- **系統匣右鍵**：快速切換啟用、開啟設定、測試彈窗、結束
 
-翻譯採用 `translate.googleapis.com` 的 `client=gtx` 端點（與你原本 JS 版本一致），屬於非官方端點，可能受網路、地區或服務策略影響而失效或被阻擋。
+翻譯使用 `translate.googleapis.com` 的 `client=gtx` 端點（非官方；可能受網路/地區/服務策略影響而失效或被阻擋）。
 
-## (2) 重要變數（請勿改名）
+## (2) 重要變數（必填）
 - ENV_NAME：`tts_tool`
 - EXE_NAME：`TTS翻譯`
 
-> 備註：EXE_NAME 也建議作為 PyInstaller 打包輸出的程式名稱。
+## (3) workspace root 定義
+本 README 所稱 **workspace root** 指你提供的專案根目錄（README.md 必須位於此目錄下）：
 
-## (3) 專案執行方式
-在本專案資料夾（與 `app_main.py` 同層）開啟終端機後：
+`D:\x1064\PEICD100\0_python\1_TTS翻譯\TTS翻譯\TTS翻譯`
 
-```bash
-python app_main.py
-```
+所有指令請在此目錄（與 `app_main.py` 同層）開啟終端機執行。
 
-建議你平常用系統匣常駐執行，若不想要跳出終端機視窗，可用：
-- `pythonw app_main.py`（Windows）
-- 或打包成 `.exe`（見下方「打包」）
-
-## (4) 專案的目錄結構
-（下列為建議放置位置：你提供的路徑可直接將本資料夾內容放進去）
-
+## (4) 檔案與資料夾結構（樹狀；最小必要集合）
 ```text
-TTS翻譯/
-  app_main.py
-  app__.py
-  README.md
-  user_data/
-    settings.json
-    logs/
-      app.log
+TTS翻譯
+├─ app_main.py
+├─ app__.py
+├─ README.md
+├─ patch_disable_ctrlc_gate.py
+├─ patch_fix_translate_stuck.py
+└─ user_data
+   ├─ settings.json
+   └─ logs
+      └─ app.log
 ```
 
-## (5) 設定檔
-設定檔位置：`user_data/settings.json`
+- 專案輸入檔案存放位置：**無**（輸入來源為「剪貼簿文字」）。
+- 專案輸出檔案存放位置：`user_data/`
+  - `user_data/settings.json`：設定檔
+  - `user_data/logs/app.log`：log
 
-欄位說明：
-- `enabled`：是否啟用（預設 `false`；未啟用時不會因 Ctrl+C 跳出彈窗）
-- `voice_en_id`：英文語音 token id（空字串表示自動挑第一個英文聲音）
-- `voice_zh_id`：中文語音 token id（空字串表示自動挑第一個中文聲音）
-- `popup_auto_hide_ms`：彈窗自動關閉毫秒數（預設 12000）
-- `max_chars`：允許觸發彈窗的最大字數（預設 500）
-- `translate_timeout_sec`：翻譯請求逾時秒數（預設 6.0）
+## (5) Python 檔名規則
+本專案包含 Python 入口點，必須遵守：**`app_main.py` + `app__.py` 同層**。
+- `app_main.py`：入口點（僅負責呼叫 `app__` 的 `main()`）
+- `app__.py`：主程式（Tray / Clipboard / Popup / Translate / TTS）
 
-## (6) log
-Log 位置：`user_data/logs/app.log`
+## (6) user_data/ 規範（所有輸入/輸出/設定預設放在 user_data/）
+- 預設所有「可持久化」資料皆放在 `user_data/`，避免污染原始碼目錄：
+  - 設定：`user_data/settings.json`
+  - 日誌：`user_data/logs/app.log`
+- 目前本工具不會將翻譯結果輸出成檔案；若未來新增「匯出翻譯」等功能，預設也必須輸出到 `user_data/`。
 
-## (7) 對外系統連線
-- 翻譯：`https://translate.googleapis.com/translate_a/single?client=gtx...`
-  - 可能受網路環境、地區或服務策略影響而失效或被阻擋
-  - 若你不想使用網路翻譯，可自行替換成離線翻譯或你偏好的翻譯 API
+## (7) Conda 環境（ENV_NAME）規範
+- 僅允許建立/修改 **ENV_NAME=tts_tool** 對應的 conda 環境。
+- 禁止改動任何其他 conda 環境（包含 `base`）。
+- 工具鏈與套件一律優先使用 conda（尤其涉及 GUI：PySide6 必須以 conda-forge 安裝）。
 
-## (8) TODO（可選）
-- 讓彈窗同時支援「播放譯文」按鈕
-- 彈窗加入「複製譯文」按鈕
-- 支援更多快捷鍵（例如 Ctrl+Shift+C 強制顯示）
+## (8) 從零開始安裝流程（可一鍵複製）
+以下命令預設在 **Anaconda Prompt（Windows CMD）** 執行。
 
-## (9) 版本資訊
-- OS：Windows 11（win-64）
-- UI：PySide6（Qt）
-- 全域快捷鍵：pynput
-- TTS：Windows SAPI（pywin32 / win32com）
-- 翻譯：translate.googleapis.com（urllib）
+### A. 推薦方案（conda-forge；成功率最高）
+（本方案使用 conda-forge 安裝 PySide6 與 pywin32；無需 pip。）
 
-## (10) 快速安裝（Conda / Pip 三選一）
-以下三種安裝方式都遵循同一個原則：先建環境，再裝套件。
-
-### A. conda-forge（建議，純 conda）
-```bash
+```bat
 conda create -n tts_tool python=3.11 -y
-conda activate tts_tool
-conda install -c conda-forge pyside6 pynput pywin32 -y
-python -c "import sys; import PySide6, pynput; import win32com.client; print('OK', sys.version)"
+conda activate base && conda activate tts_tool
+conda install -c conda-forge pyside6 pywin32 pynput pyinstaller -y
+python -c "import sys; print(sys.executable); print(sys.prefix); import PySide6; import win32com.client; import pynput; import PyInstaller; print('OK')"
+```
+
+執行程式（與上方安裝指令分離；不可併入第 5 行）：
+```bat
 python app_main.py
 ```
 
-### B. conda-forge + pip（如果你想額外裝 pyttsx3 做備援）
-```bash
+### B. 備援方案（conda + pip；僅在 conda-forge 某套件不可用/失敗時使用）
+（若你遇到 conda-forge 安裝 `pywin32` 失敗或版本不相容，可改用 pip 補裝。這是備援，不是常態。）
+
+```bat
 conda create -n tts_tool python=3.11 -y
-conda activate tts_tool
-conda install -c conda-forge pyside6 pynput pywin32 -y
-pip install pyttsx3
-python -c "import sys; import PySide6, pynput; import win32com.client; import pyttsx3; print('OK', sys.version)"
+conda activate base && conda activate tts_tool
+conda install -c conda-forge pyside6 pynput pyinstaller -y
+pip install pywin32
+python -c "import sys; print(sys.executable); print(sys.prefix); import PySide6; import win32com.client; import pynput; import PyInstaller; print('OK')"
 ```
 
-### C. pip-only（不建議，但可用）
-```bash
-python -m venv .venv
-.venv\Scripts\activate
-pip install -U pip
-pip install PySide6 pynput pywin32
-python -c "import sys; import PySide6, pynput; import win32com.client; print('OK', sys.version)"
+執行程式：
+```bat
+python app_main.py
 ```
 
-補充：Anaconda 官方也說明了在 conda 環境中必要時可使用 pip 安裝 PyPI 套件，但 conda 不會完全追蹤 pip 裝的相依性，需自行留意相依衝突。
+## (9) 測試方式
+1. 執行 `python app_main.py` 後，確認右下角系統匣出現「TTS翻譯」圖示。
+2. **預設未啟用**：請先右鍵系統匣圖示，勾選「啟用」。
+3. 打開任意應用程式（記事本/瀏覽器等），選取一段文字按 `Ctrl+C`。
+4. 滑鼠旁應彈出視窗：
+   - 顯示原文預覽
+   - 顯示翻譯結果（若一直卡在「翻譯中…」，見下方 Troubleshooting）
+   - 按「播」會播放原文（需 Windows SAPI + pywin32）
 
-## 打包成 EXE（PyInstaller）
-在已安裝相依套件的環境中執行（建議用 A 或 B）：
+### Troubleshooting
+- **按 Ctrl+C 沒反應**
+  - 確認系統匣右鍵選單「啟用」已勾選。
+  - 若你希望「只要剪貼簿變更就觸發」（更穩定，避免全域鍵盤 hook 權限問題），可在與 `app__.py` 同層執行：
+    - `python patch_disable_ctrlc_gate.py`
+- **一直卡在「翻譯中…」**
+  - 這通常是背景執行緒完成翻譯後沒有正確回到 GUI thread 更新 UI。
+  - 在與 `app__.py` 同層執行：
+    - `python patch_fix_translate_stuck.py`
+- **播放按鈕不可用**
+  - 請確認已安裝 `pywin32`，並且 Windows 有可用語音（SAPI voices）。
+  - 可用系統匣左鍵開設定，選擇英文/中文語音。
 
-```bash
-conda activate tts_tool
-conda install -c conda-forge pyinstaller -y
-pyinstaller -F -w -n "TTS翻譯" app_main.py ^
-  --clean -y ^
-  --hidden-import win32com.client --hidden-import pythoncom
+## (10) 打包成 .exe（必填；提供可複製指令）
+以下以 PyInstaller 打包為單一可攜 `.exe`。
+
+注意：PyInstaller 會產生/覆寫 `dist/` 與 `build/`（屬 build artifacts）。若你已有人為保留的內容，請先自行備份再執行。
+
+```bat
+conda activate base && conda activate tts_tool
+pyinstaller -F -w -n "TTS翻譯" app_main.py -y --clean --hidden-import win32com.client --hidden-import pythoncom
 ```
 
-輸出位置：`dist/TTS翻譯.exe`
+輸出位置：`dist\TTS翻譯.exe`
 
-# ========================================
-# [凍結區塊] GitHub 操作指令（請勿更動）
-# ========================================
-# 1) git clone https://github.com/peicd100/tts_tool.git
-# 2) cd ENV_NAME
-# 3) git checkout -b <branch-name>
+## (11) 使用者要求（必填；長期約束；需持續維護）
+- 只要程式需要 GUI/視窗，介面層一律使用 **PySide6**（不得改用 Tkinter/PyQt/Electron 等）。
+- 只要涉及 PySide6，**conda 安裝必須指定 conda-forge**；只有在 conda-forge 明確不可行且有可重現證據時，才允許改用 pip。
+- 深色主題固定要求：
+  - 全域 accent color：`#72e3fd`
+  - Window/Background：`#0f141a`
+  - Surface/Card：`#141b2d`
+  - Text：`#e8eef4`
+- 顏色必須「單一來源」集中管理（例如統一放在 `app__.py` 的 Theme 常數），禁止在多處散落硬編碼。
+- 任何改動入口點/安裝方式/輸入輸出/設定位置/GUI 框架規則時，必須同步更新本 README 相關章節並保持一致。
 
-# 推送（首推）
-# 4) git add .
-# 5) git commit -m "init"
-# 6) git remote add origin https://github.com/peicd100/tts_tool.git
-# 7) git push -u origin <branch-name>
+## (12) GitHub操作指令（必填；必須置於 README.md 最後面；凍結區塊）
 
-# 之後推送
-# 8) git add .
-# 9) git commit -m "update"
-# 10) git push
-# ========================================
+# 初始化
+```
+(
+echo.
+echo # ignore build outputs
+echo dist/
+echo build/
+)>> .gitignore
+git init
+git branch -M main
+git remote add origin https://github.com/peicd100/tts_tool.git
+git add .
+git commit -m "PEICD100"
+git push -u origin main
+```
+
+# 例行上傳
+```
+git add .
+git commit -m "PEICD100"
+git push -u origin main
+```
+
+# 還原成Git Hub最新資料
+```
+git rebase --abort || echo "No rebase in progress" && git fetch origin && git switch main && git reset --hard origin/main && git clean -fd && git status
+```
+
+# 查看儲存庫
+```
+git remote -v
+```
+
+# 克隆儲存庫
+```
+git clone https://github.com/peicd100/tts_tool.git
+```
