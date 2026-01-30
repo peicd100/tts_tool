@@ -32,9 +32,10 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 # pynput：全域滑鼠監聽（點擊/滾輪關閉彈窗）
 try:
-    from pynput import mouse  # type: ignore
+    from pynput import mouse, keyboard  # type: ignore
 except Exception:
     mouse = None  # type: ignore
+    keyboard = None  # type: ignore
 
 # pywin32：Windows SAPI TTS
 try:
@@ -66,7 +67,7 @@ DEFAULT_MAX_CHARS_PER_LINE = 18
 
 # 彈窗位置模式
 POS_CURSOR = "cursor"
-POS_WINDOW_CENTER = "window_center"
+POS_SCREEN_CENTER = "screen_center"
 DEFAULT_POSITION_MODE = POS_CURSOR
 
 # Theme
@@ -100,6 +101,9 @@ class Settings:
 
     popup_position_mode: str = DEFAULT_POSITION_MODE
 
+    # 全域快捷鍵（pynput 格式，例如 <ctrl>+<alt>+x）；空字串代表不啟用
+    global_hotkey: str = ""
+
 
 class SettingsStore:
     """
@@ -126,7 +130,7 @@ class SettingsStore:
                         if hasattr(s, k):
                             setattr(s, k, v)
                 s.enabled = DEFAULT_ENABLED_RUNTIME
-                if s.popup_position_mode not in (POS_CURSOR, POS_WINDOW_CENTER):
+                if s.popup_position_mode not in (POS_CURSOR, POS_SCREEN_CENTER):
                     s.popup_position_mode = DEFAULT_POSITION_MODE
                 return s
             except Exception as e:
@@ -496,25 +500,49 @@ class GlobalMouseWatcher(QtCore.QObject):
 
 
 # -----------------------------
-# 位置計算（滑鼠旁邊 / 滑鼠所在視窗正中心）
+# 全域快捷鍵監聽
 # -----------------------------
-def get_top_level_window_rect_at(x: int, y: int) -> Optional[Tuple[int, int, int, int]]:
-    """取得滑鼠所在 top-level 視窗 Rect (L, T, R, B)。"""
-    if win32gui is None or win32con is None:
-        return None
-    try:
-        hwnd = win32gui.WindowFromPoint((int(x), int(y)))
-        if not hwnd:
-            return None
-        hwnd_root = win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
-        if hwnd_root:
-            hwnd = hwnd_root
-        l, t, r, b = win32gui.GetWindowRect(hwnd)
-        if r <= l or b <= t:
-            return None
-        return int(l), int(t), int(r), int(b)
-    except Exception:
-        return None
+class GlobalHotkeyWatcher(QtCore.QObject):
+    triggered = QtCore.Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._listener = None
+        self._hotkey_str = ""
+
+    def update_hotkey(self, hotkey_str: str) -> None:
+        new_str = (hotkey_str or "").strip()
+        if new_str == self._hotkey_str:
+            return
+
+        self.stop()
+        self._hotkey_str = new_str
+
+        if not self._hotkey_str:
+            return
+
+        if keyboard is None:
+            logging.warning("pynput.keyboard 不可用：無法啟用全域快捷鍵")
+            return
+
+        try:
+            self._listener = keyboard.GlobalHotKeys({self._hotkey_str: self._on_activate})
+            self._listener.start()
+            logging.info("GlobalHotkeyWatcher started: %s", self._hotkey_str)
+        except Exception as e:
+            logging.warning("Failed to start hotkey listener (%s): %s", self._hotkey_str, e)
+            self._listener = None
+
+    def _on_activate(self) -> None:
+        self.triggered.emit()
+
+    def stop(self) -> None:
+        if self._listener:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
 
 
 # -----------------------------
@@ -571,11 +599,12 @@ class PopupWidget(QtWidgets.QWidget):
         outer.setContentsMargins(10, 10, 10, 10)
         outer.addWidget(root)
 
-        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(26)
-        shadow.setOffset(0, 10)
-        shadow.setColor(QtGui.QColor(0, 0, 0, 130))
-        root.setGraphicsEffect(shadow)
+        # 移除陰影
+        # shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        # shadow.setBlurRadius(26)
+        # shadow.setOffset(0, 10)
+        # shadow.setColor(QtGui.QColor(0, 0, 0, 130))
+        # root.setGraphicsEffect(shadow)
 
         self.setStyleSheet(self._style_sheet())
         self.set_playing(False)
@@ -695,17 +724,9 @@ class PopupWidget(QtWidgets.QWidget):
         screen = QtGui.QGuiApplication.screenAt(pos) or QtGui.QGuiApplication.primaryScreen()
         geo = screen.availableGeometry() if screen else QtCore.QRect(0, 0, 1920, 1080)
 
-        if position_mode == POS_WINDOW_CENTER:
-            rect = get_top_level_window_rect_at(cx, cy)
-            if rect is not None:
-                l, t, r, b = rect
-                center_x = (l + r) // 2
-                center_y = (t + b) // 2
-                x = center_x - self.width() // 2
-                y = center_y - self.height() // 2
-            else:
-                x = geo.center().x() - self.width() // 2
-                y = geo.center().y() - self.height() // 2
+        if position_mode == POS_SCREEN_CENTER:
+            x = geo.center().x() - self.width() // 2
+            y = geo.center().y() - self.height() // 2
         else:
             x = cx + 18
             y = cy + 18
@@ -852,7 +873,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
         self.cmb_pos = QtWidgets.QComboBox()
         self.cmb_pos.addItem("滑鼠旁邊", userData=POS_CURSOR)
-        self.cmb_pos.addItem("滑鼠所在視窗正中心", userData=POS_WINDOW_CENTER)
+        self.cmb_pos.addItem("顯示器正中心", userData=POS_SCREEN_CENTER)
 
         self.lbl_pos_hint = QtWidgets.QLabel("")
         self.lbl_pos_hint.setStyleSheet(f"color: {MUTED};")
@@ -863,7 +884,7 @@ class SettingsDialog(QtWidgets.QDialog):
         dlay.addRow("提示：", self.lbl_pos_hint)
         lay.addWidget(grp_display)
 
-        grp_misc = QtWidgets.QGroupBox("翻譯")
+        grp_misc = QtWidgets.QGroupBox("翻譯與操作")
         mlay = QtWidgets.QFormLayout(grp_misc)
         mlay.setContentsMargins(12, 12, 12, 12)
         mlay.setSpacing(10)
@@ -877,8 +898,28 @@ class SettingsDialog(QtWidgets.QDialog):
         self.spn_max.setRange(50, 5000)
         self.spn_max.setSingleStep(50)
 
+        self.chk_hk_ctrl = QtWidgets.QCheckBox("Ctrl")
+        self.chk_hk_alt = QtWidgets.QCheckBox("Alt")
+        self.chk_hk_shift = QtWidgets.QCheckBox("Shift")
+        self.cmb_hk_key = QtWidgets.QComboBox()
+        self.cmb_hk_key.addItem("（無）", userData="")
+        for i in range(10):
+            self.cmb_hk_key.addItem(str(i), userData=str(i))
+        for i in range(ord('a'), ord('z') + 1):
+            c = chr(i)
+            self.cmb_hk_key.addItem(c.upper(), userData=c)
+
+        hk_widget = QtWidgets.QWidget()
+        hk_lay = QtWidgets.QHBoxLayout(hk_widget)
+        hk_lay.setContentsMargins(0, 0, 0, 0)
+        hk_lay.addWidget(self.chk_hk_ctrl)
+        hk_lay.addWidget(self.chk_hk_alt)
+        hk_lay.addWidget(self.chk_hk_shift)
+        hk_lay.addWidget(self.cmb_hk_key, 1)
+
         mlay.addRow("翻譯逾時：", self.dsp_timeout)
         mlay.addRow("最長字數：", self.spn_max)
+        mlay.addRow("全域快捷鍵：", hk_widget)
         lay.addWidget(grp_misc)
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -901,10 +942,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self._populate_voices()
 
         self.lbl_tts_state.setText("可用" if self._tts_available else "不可用（未安裝 pywin32 或 SAPI 初始化失敗）")
-        if self._tts_available and (win32gui is None or win32con is None):
-            self.lbl_pos_hint.setText("「視窗正中心」需要 win32gui（pywin32）；目前不可用，將自動退回螢幕中心。")
-        else:
-            self.lbl_pos_hint.setText("「滑鼠旁邊」更像翻譯泡泡；「視窗正中心」適合固定閱讀。")
+        self.lbl_pos_hint.setText("「滑鼠旁邊」更像翻譯泡泡；「顯示器正中心」適合固定閱讀。")
 
     def _populate_voices(self) -> None:
         self.cmb_zh.clear()
@@ -934,6 +972,21 @@ class SettingsDialog(QtWidgets.QDialog):
         self.spn_font.setValue(int(s.font_size))
         self.spn_line.setValue(int(s.max_chars_per_line))
 
+        # Parse hotkey string (e.g. <ctrl>+<alt>+x)
+        hotkey = (s.global_hotkey or "").lower()
+        parts = [p.strip() for p in hotkey.split("+") if p.strip()]
+        self.chk_hk_ctrl.setChecked("<ctrl>" in parts)
+        self.chk_hk_alt.setChecked("<alt>" in parts)
+        self.chk_hk_shift.setChecked("<shift>" in parts)
+
+        key_val = ""
+        for p in parts:
+            if not (p.startswith("<") and p.endswith(">")):
+                key_val = p
+                break
+        idx = self.cmb_hk_key.findData(key_val)
+        self.cmb_hk_key.setCurrentIndex(idx if idx >= 0 else 0)
+
         idx = self.cmb_zh.findData(s.voice_zh_id)
         self.cmb_zh.setCurrentIndex(idx if idx >= 0 else 0)
 
@@ -944,6 +997,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.cmb_pos.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _on_save(self) -> None:
+        parts = []
+        if self.chk_hk_ctrl.isChecked():
+            parts.append("<ctrl>")
+        if self.chk_hk_alt.isChecked():
+            parts.append("<alt>")
+        if self.chk_hk_shift.isChecked():
+            parts.append("<shift>")
+        k = self.cmb_hk_key.currentData()
+        if k:
+            parts.append(str(k))
+        final_hotkey = "+".join(parts) if k else ""
+
         s = Settings(
             enabled=self.chk_enabled.isChecked(),  # runtime only（不落盤）
             voice_zh_id=str(self.cmb_zh.currentData() or ""),
@@ -953,6 +1018,7 @@ class SettingsDialog(QtWidgets.QDialog):
             font_size=int(self.spn_font.value()),
             max_chars_per_line=int(self.spn_line.value()),
             popup_position_mode=str(self.cmb_pos.currentData() or DEFAULT_POSITION_MODE),
+            global_hotkey=final_hotkey,
         )
         self._store.save(s)
         self._s = s
@@ -984,6 +1050,10 @@ class AppController(QtCore.QObject):
         self.mouse_watcher.clicked.connect(self.on_global_click)
         self.mouse_watcher.wheel.connect(self.on_global_wheel)
         self.mouse_watcher.start()
+
+        self.hotkey_watcher = GlobalHotkeyWatcher()
+        self.hotkey_watcher.triggered.connect(self.on_hotkey_triggered)
+        self.hotkey_watcher.update_hotkey(self.settings.global_hotkey)
 
         self.clipboard = self.app.clipboard()
         self.clipboard.dataChanged.connect(self.on_clipboard_changed)
@@ -1040,6 +1110,7 @@ class AppController(QtCore.QObject):
         else:
             self.settings = s
         self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
+        self.hotkey_watcher.update_hotkey(self.settings.global_hotkey)
 
     def _create_tray(self) -> QtWidgets.QSystemTrayIcon:
         tray = QtWidgets.QSystemTrayIcon(self._make_tray_icon(), self.app)
@@ -1151,6 +1222,15 @@ class AppController(QtCore.QObject):
 
     def test_popup(self) -> None:
         self.show_popup("There are many traffic lights on the street.")
+
+    @QtCore.Slot()
+    def on_hotkey_triggered(self) -> None:
+        # 快捷鍵觸發：若未啟用則不動作
+        if not self.runtime_enabled:
+            return
+        text = (self.clipboard.text() or "").strip()
+        if text:
+            self.show_popup(text)
 
     # -------------------------
     # Clipboard trigger
@@ -1290,6 +1370,10 @@ class AppController(QtCore.QObject):
             pass
         try:
             self.mouse_watcher.stop()
+        except Exception:
+            pass
+        try:
+            self.hotkey_watcher.stop()
         except Exception:
             pass
         try:

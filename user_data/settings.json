@@ -5,5 +5,6 @@
   "translate_timeout_sec": 6.0,
   "font_size": 12,
   "max_chars_per_line": 18,
-  "popup_position_mode": "cursor"
+  "popup_position_mode": "screen_center",
+  "global_hotkey": "<ctrl>+c"
 }
