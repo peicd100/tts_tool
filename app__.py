@@ -129,7 +129,8 @@ class SettingsStore:
                 if s.popup_position_mode not in (POS_CURSOR, POS_WINDOW_CENTER):
                     s.popup_position_mode = DEFAULT_POSITION_MODE
                 return s
-            except Exception:
+            except Exception as e:
+                logging.warning("Settings load failed (using defaults): %s", e)
                 return s
 
     def save(self, s: Settings) -> None:
@@ -144,17 +145,21 @@ class SettingsStore:
                     obj = json.loads(raw)
                     if isinstance(obj, dict):
                         existing = obj
-            except Exception:
+            except Exception as e:
+                logging.warning("Settings save (read existing) failed: %s", e)
                 existing = {}
 
             data = asdict(s)
             data.pop("enabled", None)  # enabled 不落盤
             existing.update(data)
 
-            self.path.write_text(
-                json.dumps(existing, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            try:
+                self.path.write_text(
+                    json.dumps(existing, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logging.error("Settings save (write) failed: %s", e)
 
 
 def _ensure_dirs() -> None:
@@ -578,7 +583,7 @@ class PopupWidget(QtWidgets.QWidget):
 
         self.apply_display_settings(self._font_size, self._max_chars_per_line)
 
-    def _style_sheet(self) -> str:
+    def _style_sheet(self, btn_radius: int = 32) -> str:
         return f"""
         #popupRoot {{
             background: rgba(20, 27, 45, 0.96);
@@ -588,7 +593,7 @@ class PopupWidget(QtWidgets.QWidget):
         #btnPlay {{
             background: rgba(255,255,255,0.06);
             border: 1px solid rgba(255,255,255,0.12);
-            border-radius: 32px;
+            border-radius: {btn_radius}px;
         }}
         #btnPlay:hover {{
             border-color: {ACCENT};
@@ -600,31 +605,55 @@ class PopupWidget(QtWidgets.QWidget):
         """
 
     def _icon_play(self) -> QtGui.QIcon:
-        pm = QtGui.QPixmap(48, 48)
+        sz = self.btn_play.iconSize().width()
+        if sz < 10:
+            sz = 26
+        pm = QtGui.QPixmap(sz, sz)
         pm.fill(QtCore.Qt.transparent)
         p = QtGui.QPainter(pm)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(QtGui.QColor(114, 227, 253, 255))
-        points = [QtCore.QPointF(18, 14), QtCore.QPointF(18, 34), QtCore.QPointF(34, 24)]
+        w, h = float(sz), float(sz)
+        points = [
+            QtCore.QPointF(w * 0.375, h * 0.29),
+            QtCore.QPointF(w * 0.375, h * 0.71),
+            QtCore.QPointF(w * 0.71, h * 0.5),
+        ]
         p.drawPolygon(QtGui.QPolygonF(points))
         p.end()
         return QtGui.QIcon(pm)
 
     def _icon_stop(self) -> QtGui.QIcon:
-        pm = QtGui.QPixmap(48, 48)
+        sz = self.btn_play.iconSize().width()
+        if sz < 10:
+            sz = 26
+        pm = QtGui.QPixmap(sz, sz)
         pm.fill(QtCore.Qt.transparent)
         p = QtGui.QPainter(pm)
         p.setRenderHint(QtGui.QPainter.Antialiasing, True)
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(QtGui.QColor(114, 227, 253, 255))
-        p.drawRoundedRect(QtCore.QRectF(16, 16, 16, 16), 4, 4)
+        w, h = float(sz), float(sz)
+        p.drawRoundedRect(QtCore.QRectF(w * 0.333, h * 0.333, w * 0.333, h * 0.333), w * 0.08, h * 0.08)
         p.end()
         return QtGui.QIcon(pm)
 
     def apply_display_settings(self, font_size: int, max_chars_per_line: int) -> None:
         self._font_size = max(10, int(font_size))
         self._max_chars_per_line = max(1, int(max_chars_per_line))
+
+        # 讓播放按鈕隨字體大小縮放
+        btn_dim = int(self._font_size * 2.8)
+        icon_dim = int(btn_dim * 0.4)
+        radius = btn_dim // 2
+
+        self.btn_play.setFixedSize(btn_dim, btn_dim)
+        self.btn_play.setIconSize(QtCore.QSize(icon_dim, icon_dim))
+        self.setStyleSheet(self._style_sheet(btn_radius=radius))
+
+        # 重新產生圖示（因為大小變了）
+        self.set_playing(self._playing)
 
         # 兩道保險：pixelSize + QLabel 自身 QSS font-size(px)
         f = self.lbl_zh.font()
@@ -1005,8 +1034,11 @@ class AppController(QtCore.QObject):
                 4500,
             )
 
-    def apply_popup_settings(self) -> None:
-        self.settings = self.store.load()
+    def apply_popup_settings(self, s: Optional[Settings] = None) -> None:
+        if s is None:
+            self.settings = self.store.load()
+        else:
+            self.settings = s
         self.popup.apply_display_settings(self.settings.font_size, self.settings.max_chars_per_line)
 
     def _create_tray(self) -> QtWidgets.QSystemTrayIcon:
@@ -1093,8 +1125,8 @@ class AppController(QtCore.QObject):
     def on_settings_changed(self, s: Settings) -> None:
         # enabled 是 runtime
         self.set_enabled(bool(s.enabled))
-        # 其餘設定：從落盤再讀一次套到彈窗
-        self.apply_popup_settings()
+        # 其餘設定：直接使用傳入的 s，不需再讀一次硬碟
+        self.apply_popup_settings(s)
         logging.info(
             "settings updated: runtime_enabled=%s font_size=%s max_chars_per_line=%s pos=%s",
             self.runtime_enabled,
@@ -1147,7 +1179,8 @@ class AppController(QtCore.QObject):
         self.popup.set_playing(False)
 
         self.popup.set_enabled_play(self._tts_available)
-        self.apply_popup_settings()
+        # 修正：使用當前記憶體中的設定，不要重新讀取硬碟（避免存檔延遲導致跳回舊值）
+        self.apply_popup_settings(self.settings)
 
         # 先顯示（中文尚未準備好）
         self.popup.show_popup(
