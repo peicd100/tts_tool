@@ -20,6 +20,7 @@ import json
 import logging
 import queue
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -78,7 +79,10 @@ TEXT = "#e8eef4"
 MUTED = "rgba(232,238,244,0.78)"
 BORDER = "rgba(114,227,253,0.32)"
 
-APP_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
 USER_DATA = APP_DIR / "user_data"
 LOG_DIR = USER_DATA / "logs"
 SETTINGS_PATH = USER_DATA / "settings.json"
