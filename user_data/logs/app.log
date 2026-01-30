@@ -1,0 +1,4 @@
+2026-01-30 08:37:43,215 INFO === TTS翻譯 啟動 ===
+2026-01-30 08:37:43,308 INFO GlobalMouseWatcher started
+2026-01-30 08:38:07,119 INFO runtime enabled set to True (not persisted)
+2026-01-30 08:38:07,126 INFO settings updated: runtime_enabled=True font_size=24 max_chars_per_line=18 pos=cursor

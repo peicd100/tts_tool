@@ -1,0 +1,9 @@
+{
+  "voice_zh_id": "",
+  "voice_en_id": "",
+  "max_chars": 500,
+  "translate_timeout_sec": 6.0,
+  "font_size": 24,
+  "max_chars_per_line": 18,
+  "popup_position_mode": "cursor"
+}
